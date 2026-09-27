@@ -2169,7 +2169,7 @@ def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
     _copy_account_profile(src, paths.runtime_dir)
     if os.name == "nt":
         marker = _windows_profile_marker(_resolve_profile_source(src))
-        if not marker.is_file() or not _windows_activate_credential(name):
+        if marker.is_file() and not _windows_activate_credential(name):
             raise ValueError(f"Account {name} is missing its Windows Credential Manager entry")
 
 
@@ -2839,7 +2839,7 @@ def login_account(
             storage_name,
             runtime_home,
             overwrite=overwrite,
-            capture_windows_credential=os.name == "nt",
+            capture_windows_credential=os.name == "nt" and _windows_active_credential_exists(),
         )
         return storage_name
 
