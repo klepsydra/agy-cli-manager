@@ -2149,13 +2149,25 @@ def add_account(paths: ManagerPaths, name: str, source_dir: Path) -> None:
     save_account_profile(paths, name, source_dir, overwrite=False)
 
 
-def import_current(paths: ManagerPaths, name: str, source_dir: Path | None = None) -> None:
+def import_current(
+    paths: ManagerPaths,
+    name: str,
+    source_dir: Path | None = None,
+    *,
+    overwrite: bool = False,
+) -> None:
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
         live_dir = source_dir or get_live_dir(state)
         if live_dir is None:
             raise ValueError("No source_dir provided and no live_dir configured.")
-    save_account_profile(paths, name, live_dir, capture_windows_credential=os.name == "nt")
+    save_account_profile(
+        paths,
+        name,
+        live_dir,
+        overwrite=overwrite,
+        capture_windows_credential=os.name == "nt",
+    )
 
 
 def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:

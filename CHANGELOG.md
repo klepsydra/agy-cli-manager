@@ -10,6 +10,8 @@
 - install `windows-curses` automatically on Windows
 - save named Windows accounts in Credential Manager so users only sign in once
 - select a saved account and launch `agy.exe` manually without a background service
+- document separate Linux service and Windows manual-launcher workflows
+- allow `import-current --replace` to refresh a saved Windows credential after reauthentication
 
 ## v0.2.2 - 2026-09-21
 

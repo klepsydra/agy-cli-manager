@@ -25,7 +25,7 @@
     "url": "https://zcop.github.io/agy-cli-manager/",
     "description": "An Antigravity CLI multi-account auth manager for account login storage, active-standby failover, quota-aware switching, coordinated runtime account rotation, and automation via CLI or Python API.",
     "programmingLanguage": "Python",
-    "runtimePlatform": "Linux, macOS, Terminal",
+    "runtimePlatform": "Linux server/backend and Windows personal launcher",
     "license": "https://github.com/zcop/agy-cli-manager/blob/main/LICENSE",
     "keywords": [
       "Antigravity CLI account manager",
@@ -203,11 +203,34 @@
     </section>
 
     <section class="section">
+      <h2>Choose the Right Platform Mode</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Linux: Server and Backend</h3>
+          <p>Run the manager continuously behind a bot or frontend. Watch quota logs, select a standby account, and coordinate restarting the managed <code>agy</code> worker.</p>
+        </div>
+        <div class="card">
+          <h3>Windows: Personal Launcher</h3>
+          <p>Save each account once in Windows Credential Manager. Exit <code>agy.exe</code>, select an account, and launch it again without repeating Google login.</p>
+        </div>
+        <div class="card">
+          <h3>Different by Design</h3>
+          <p>Automatic service failover is a Linux workflow. Windows defaults to manual switching and refuses to replace credentials while <code>agy.exe</code> is running.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
       <h2>Install</h2>
       <pre><code>python3 -m venv .venv
 . .venv/bin/activate
 pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.2/agy_cli_manager-0.2.2-py3-none-any.whl</code></pre>
       <p><strong>Safety notice:</strong> v0.2.0 can delete files in <code>~/.gemini</code>, <code>~/.local</code>, <code>~/.cache</code>, and <code>~/.config</code> during login or account switching. If you installed v0.2.0, upgrade to v0.2.2 before using those commands.</p>
+      <h3>Windows launcher workflow</h3>
+      <pre><code>agy-cli-manager.exe import-current work
+agy-cli-manager.exe import-current personal
+agy-cli-manager.exe launch work</code></pre>
+      <p>Sign into each Windows account once before capturing it. For later switches, exit all <code>agy.exe</code> processes and use <code>launch &lt;name&gt;</code>. See the repository README for the complete platform-specific guide.</p>
     </section>
 
     <section class="section">

@@ -44,63 +44,32 @@ Project links:
 - supports account failover with cooldowns and lock-protected state changes
 - tails Antigravity CLI logs so a running `agy` TUI can trigger failover without a bot caller
 
+## Platform modes
+
+Linux and Windows intentionally use different operating models:
+
+| Capability | Linux server/backend | Windows personal launcher |
+| --- | --- | --- |
+| Credential storage | Saved `.gemini` profiles | Windows Credential Manager |
+| Normal operation | Long-running backend, bot, watcher, or dashboard | User selects an account and launches `agy.exe` |
+| Switching | Manual or automatic failover | Manual only |
+| Running `agy` during switch | Worker must be restarted after changing profile | Switch is refused until `agy.exe` exits |
+| Recommended command | `agy-cli-manager watch` | `agy-cli-manager.exe launch <name>` |
+| Background service | Supported deployment model | Not required or promised |
+
+Linux is the primary automation platform. Windows support is deliberately a
+modest personal launcher whose purpose is to avoid signing in again whenever a
+user changes accounts.
+
 ## Requirements
 
 - Python 3.10+
 - a working `agy` binary available in `PATH`, or passed explicitly with `--agy-binary`
 - a terminal if you want to use `login` or the full-screen dashboard
 
-Windows is supported as a manual account launcher, not as a background
-failover service. Install the native Antigravity CLI first from PowerShell:
-
-```powershell
-irm https://antigravity.google/cli/install.ps1 | iex
-agy --version
-```
-
-If `agy` is not already on `PATH`, the manager also checks the standard
-Windows install location `%LOCALAPPDATA%\agy\bin\agy.exe`.
-
-Then create and activate the manager environment:
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-py -m pip install --upgrade pip
-py -m pip install .
-```
-
-The downloadable Windows executable bundles Python and its libraries. A local
-Python installation is not required for that build. Installing from source
-installs `windows-curses` automatically for the dashboard.
-Manager state defaults to `%USERPROFILE%\.agy-cli-manager`, and the live
-profile defaults to `%USERPROFILE%\.gemini`. Use `--root` and `set-live-dir`
-to choose different locations.
-
-On Windows, `agy` authentication is stored in Windows Credential Manager. For
-each account, complete the normal `agy` sign-in once, exit `agy`, and capture
-the current credential under a name:
-
-```powershell
-agy-cli-manager.exe import-current work
-# Use agy's normal sign-out/sign-in flow once for the next account, then exit:
-agy-cli-manager.exe import-current personal
-```
-
-After both accounts are saved, close any running `agy.exe` and launch the
-desired account without signing in again:
-
-```powershell
-agy-cli-manager.exe launch work
-agy-cli-manager.exe launch personal
-```
-
-The launcher refuses to replace the active credential while `agy.exe` is
-running. This is deliberate: an existing process has already loaded its
-credential. Windows remains manual-only; automatic service failover is the
-Linux deployment model.
-
 ## Install
+
+### Linux
 
 From a GitHub release wheel:
 
@@ -137,7 +106,34 @@ or:
 PYTHONPATH=src python3 -m agy_cli_manager.cli --help
 ```
 
-## Quick Start
+### Windows
+
+Install the native Antigravity CLI first and confirm `agy` works:
+
+```powershell
+irm https://antigravity.google/cli/install.ps1 | iex
+agy --version
+```
+
+Download `agy-cli-manager-windows-x64.exe` from the matching GitHub release.
+It bundles Python and its libraries, so Python does not need to be installed.
+If `agy` is not on `PATH`, the launcher also checks
+`%LOCALAPPDATA%\agy\bin\agy.exe`.
+
+To run from source instead:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install --upgrade pip
+py -m pip install .
+agy-cli-manager.exe --help
+```
+
+State defaults to `%USERPROFILE%\.agy-cli-manager`. Authentication secrets
+remain in Windows Credential Manager.
+
+## Linux server/backend guide
 
 ### 1. Initialize the manager state
 
@@ -203,6 +199,81 @@ agy-cli-manager ack-restart
 ```
 
 Leave the dashboard open instead of `watch` if you prefer (`Y` acknowledges the restart). Do not pass `--from-start` unless you intend to replay old quota errors.
+
+For a bot or another frontend, call the JSON commands or Python API rather
+than parsing the dashboard. Keep the watcher/backend running, let it select the
+next usable account, then restart the managed `agy` worker after a switch.
+
+## Windows personal-launcher guide
+
+Windows does not run the Linux-style failover service. The one-time setup and
+normal daily workflow are different.
+
+### Save the first account
+
+1. Sign into the desired account using normal `agy` login.
+2. Exit every `agy.exe` process.
+3. Capture the current Windows credential:
+
+```powershell
+agy-cli-manager.exe import-current work
+```
+
+### Save another account
+
+1. Open `agy` and use its normal account/sign-out flow to sign into the next
+   account. This login is required only once.
+2. Exit every `agy.exe` process.
+3. Capture the new current credential:
+
+```powershell
+agy-cli-manager.exe import-current personal
+```
+
+Repeat these steps once for each account. Confirm the saved names with:
+
+```powershell
+agy-cli-manager.exe list
+agy-cli-manager.exe current
+```
+
+### Switch and launch without logging in again
+
+Close the current `agy` window, then use one command:
+
+```powershell
+agy-cli-manager.exe launch work
+```
+
+Later, exit that `agy` session and choose another account:
+
+```powershell
+agy-cli-manager.exe launch personal
+```
+
+`launch` checks that `agy.exe` is not running, replaces the active
+`gemini:antigravity` credential with the selected saved credential, records
+the selected account, and starts a fresh `agy.exe` in the same terminal.
+
+### Refresh a saved login
+
+If Google requires reauthentication, sign into that account normally, exit
+`agy`, and replace its saved credential:
+
+```powershell
+agy-cli-manager.exe import-current work --replace
+```
+
+### Windows safety and limitations
+
+- Do not switch credentials while `agy.exe` is running. The process has
+  already loaded its previous credential.
+- `--force` is an emergency override, not the normal workflow.
+- Windows defaults to `manual` switch mode.
+- `watch`, automatic failover, bot-backend service operation, and transparent
+  process restart are Linux workflows, not Windows launcher promises.
+- The first login for every account and later reauthentication still require
+  the normal Google/Antigravity login flow.
 
 ## First Useful Commands
 

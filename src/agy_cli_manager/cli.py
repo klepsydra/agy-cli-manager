@@ -132,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd = sub.add_parser("import-current", help="Import the current live_dir or a provided source dir as an account")
     import_cmd.add_argument("name")
     import_cmd.add_argument("source_dir", type=Path, nargs="?")
+    import_cmd.add_argument("--replace", action="store_true", help="Replace an existing saved account")
 
     login = sub.add_parser("login", help="Run isolated agy login and save the resulting profile")
     login.add_argument("name", nargs="?")
@@ -2107,7 +2108,7 @@ def main() -> int:
             print(f"added: {args.name}")
             return 0
         if args.command == "import-current":
-            import_current(paths, args.name, args.source_dir)
+            import_current(paths, args.name, args.source_dir, overwrite=args.replace)
             print(f"imported-current: {args.name}")
             return 0
         if args.command == "login":

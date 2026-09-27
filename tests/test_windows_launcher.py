@@ -52,6 +52,16 @@ class WindowsLauncherTests(unittest.TestCase):
         switch.assert_called_once_with(self.paths, "personal", force=False)
         self.assertEqual(call.call_args.args[0], ["agy.exe"])
 
+    def test_import_current_replace_refreshes_existing_profile(self) -> None:
+        self.add_file_account("work")
+        replacement = self.base / "replacement"
+        token = replacement / TOKEN_PATH
+        token.parent.mkdir(parents=True)
+        token.write_text("new-token", encoding="utf-8")
+        m.import_current(self.paths, "work", replacement, overwrite=True)
+        saved = m.account_dir(self.paths, "work") / TOKEN_PATH
+        self.assertEqual(saved.read_text(encoding="utf-8"), "new-token")
+
     @unittest.skipUnless(os.name == "nt", "requires Windows Credential Manager")
     def test_windows_credential_round_trip(self) -> None:
         target = f"agy-cli-manager:test:{os.getpid()}"
