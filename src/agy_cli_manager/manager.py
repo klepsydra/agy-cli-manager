@@ -24,6 +24,8 @@ if os.name == "nt":
 else:
     import fcntl
 
+from agy_cli_manager.watch import get_log_watch_snapshot
+
 
 MANAGED_PROFILE_FILES = (
     "antigravity-cli/antigravity-oauth-token",
@@ -38,7 +40,7 @@ EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNO
 APPLY_AUTH_EMAIL_PATTERN = re.compile(r"applyAuthResult:\s+email=([^,\s]+)", re.IGNORECASE)
 DEFAULT_REFRESH_POLICY_SECONDS = 1800
 USAGE_WINDOW_NAMES = ("short", "weekly")
-DEFAULT_SWITCH_MODE = "auto"
+DEFAULT_SWITCH_MODE = "manual" if os.name == "nt" else "auto"
 VALID_SWITCH_MODES = ("auto", "manual")
 DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD = 2
 DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT = 10.0
@@ -76,6 +78,8 @@ if os.name == "nt":
     _ADVAPI32.CredReadW.restype = ctypes.c_bool
     _ADVAPI32.CredWriteW.argtypes = [ctypes.POINTER(_WindowsCredential), ctypes.c_uint32]
     _ADVAPI32.CredWriteW.restype = ctypes.c_bool
+    _ADVAPI32.CredDeleteW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+    _ADVAPI32.CredDeleteW.restype = ctypes.c_bool
     _ADVAPI32.CredFree.argtypes = [ctypes.c_void_p]
     _ADVAPI32.CredFree.restype = ctypes.c_bool
 
@@ -112,6 +116,17 @@ def _windows_write_credential(target: str, blob: bytes, user_name: str | None) -
     if not _ADVAPI32.CredWriteW(ctypes.byref(credential), 0):
         error_code = ctypes.get_last_error()
         raise OSError(error_code, f"Windows Credential Manager write failed for {target}")
+
+
+def _windows_delete_credential(target: str) -> bool:
+    if os.name != "nt":
+        return False
+    if _ADVAPI32.CredDeleteW(target, 1, 0):
+        return True
+    error_code = ctypes.get_last_error()
+    if error_code == 1168:  # ERROR_NOT_FOUND
+        return False
+    raise OSError(error_code, f"Windows Credential Manager delete failed for {target}")
 
 
 def _windows_capture_active_credential(account_name: str) -> bool:
@@ -319,14 +334,21 @@ def load_state(paths: ManagerPaths) -> dict:
     data["switch_policy"] = _normalize_switch_policy(data.get("switch_policy"))
     data["switch_runtime"] = _normalize_switch_runtime(data.get("switch_runtime"))
     data["switch_history"] = _normalize_switch_history(data.get("switch_history"))
-    if data.get("live_dir") is None:
-        data["live_dir"] = str(default_live_dir())
     return data
 
 
 def save_state(paths: ManagerPaths, state: dict) -> None:
-    with paths.state_file.open("w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=paths.state_file.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, paths.state_file)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _normalize_switch_mode(value: object) -> str:
@@ -514,7 +536,16 @@ def _append_switch_history(
 
 
 def account_dir(paths: ManagerPaths, name: str) -> Path:
-    return paths.accounts_dir / name
+    if not isinstance(name, str) or not name.strip() or name in {".", ".."}:
+        raise ValueError("Account name must be a non-empty directory name.")
+    if "/" in name or "\\" in name or Path(name).name != name:
+        raise ValueError("Account name cannot contain path separators.")
+    if os.name == "nt" and normalize_account_storage_name(name) != name:
+        raise ValueError("Account name is not a valid Windows directory name.")
+    target = paths.accounts_dir / name
+    if target.is_symlink():
+        raise ValueError(f"Account directory cannot be a symlink: {name}")
+    return target
 
 
 def _clear_directory(path: Path) -> None:
@@ -570,6 +601,26 @@ def _agy_subprocess_env(home_root: Path) -> dict[str, str]:
             env["HOMEPATH"] = tail or "\\"
     env["PATH"] = env.get("PATH", os.defpath)
     return env
+
+
+def is_agy_running() -> bool:
+    """Return whether a native Windows agy process is already running."""
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq agy.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    for line in (result.stdout or "").splitlines():
+        if line.strip().lower().startswith('"agy.exe"'):
+            return True
+    return False
 
 
 def _copy_managed_profile_files(source: Path, target: Path) -> None:
@@ -1106,7 +1157,7 @@ def _best_switch_candidate(paths: ManagerPaths, state: dict, *, exclude: str | N
         ranked.append((score, name))
 
     if not ranked:
-        return candidates[0]
+        return None
 
     ranked.sort(key=lambda item: item[0])
     return ranked[0][1]
@@ -1285,8 +1336,6 @@ def list_models(
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
         account_name, source_home = _resolve_usage_refresh_target(paths, state, name)
-        live_dir = get_live_dir(state)
-    runtime_home = resolve_runtime_home(live_dir)
     if not profile_has_login_artifacts(_resolve_profile_source(source_home)):
         fallback_home = account_dir(paths, account_name)
         if name is None and profile_has_login_artifacts(_resolve_profile_source(fallback_home)):
@@ -1294,24 +1343,7 @@ def list_models(
         else:
             raise ValueError(f"Profile source is missing required auth files: {_resolve_profile_source(source_home)}")
 
-    if name is None:
-        models = _run_agy_models_command(source_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
-        return {
-            "account": account_name,
-            "source_home": str(source_home),
-            "models": models,
-            "count": len(models),
-        }
-
-    with tempfile.TemporaryDirectory(prefix="agy-models-restore-") as restore_root_str:
-        restore_root = Path(restore_root_str)
-        restore_home = restore_root / "home"
-        _copy_account_profile(runtime_home, restore_home)
-        try:
-            _copy_account_profile(source_home, runtime_home)
-            models = _run_agy_models_command(runtime_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
-        finally:
-            _copy_account_profile(restore_home, runtime_home)
+    models = _run_agy_models_command(source_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
     return {
         "account": account_name,
         "source_home": str(source_home),
@@ -1341,9 +1373,20 @@ def refresh_account_usage(
     agy_binary: str | None = None,
     warmup_timeout_seconds: int = 45,
 ) -> UsageRefreshResult:
+    live_home = None
+    initial_live_token = None
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
-        account_name, source_home = _resolve_usage_refresh_target(paths, state, name)
+        account_name, _ = _resolve_usage_refresh_target(paths, state, name)
+        source_home = account_dir(paths, account_name)
+        if name is None and state.get("active") == account_name:
+            live_dir = get_live_dir(state)
+            if live_dir is not None:
+                live_home = live_dir.parent
+                live_token = _oauth_token_path(live_home)
+                if live_token.is_file():
+                    initial_live_token = live_token.read_bytes()
+                    _copy_managed_profile_files(_resolve_profile_source(live_home), source_home / ".gemini")
     try:
         needs_warmup = False
         try:
@@ -1412,17 +1455,6 @@ def refresh_account_usage(
         )
 
         refreshed_at = utc_now()
-        if source_home != account_dir(paths, account_name):
-            target_dir = account_dir(paths, account_name)
-            if target_dir.exists():
-                source_profile = _resolve_profile_source(source_home)
-                target_profile = target_dir / ".gemini"
-                _copy_managed_profile_files(source_profile, target_profile)
-                project_id_file = _project_id_path(source_home)
-                if project_id_file.is_file():
-                    dst_project_id = _project_id_path(target_dir)
-                    dst_project_id.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(project_id_file, dst_project_id)
         refreshed_identity = detect_profile_identity(account_dir(paths, account_name))
         if not refreshed_identity.get("account_name") and isinstance(access_token, str) and access_token.strip():
             try:
@@ -1436,6 +1468,13 @@ def refresh_account_usage(
             meta = state["accounts"].get(account_name)
             if meta is None:
                 raise ValueError(f"Account not found: {account_name}")
+            # A warmup may refresh the saved token. Publish it only if the
+            # same account is still active and agy has not updated live auth.
+            if live_home is not None and initial_live_token is not None and state.get("active") == account_name:
+                live_token = _oauth_token_path(live_home)
+                saved_token = _oauth_token_path(source_home)
+                if live_token.is_file() and saved_token.is_file() and live_token.read_bytes() == initial_live_token:
+                    shutil.copy2(saved_token, live_token)
             windows = _normalize_usage_windows(meta)
             windows["short"]["status"] = result.short_usage_status
             windows["short"]["value"] = result.short_usage_value
@@ -1790,44 +1829,36 @@ def probe_profile_identity_via_usage(
     profile_source = _resolve_profile_source(source_dir)
     if not profile_has_login_artifacts(profile_source):
         raise ValueError(f"Profile source is missing required auth files: {profile_source}")
-    runtime_home = resolve_runtime_home(live_dir)
+    # Each saved account is already a complete home. Probing it directly keeps
+    # the shared live home and the manager runtime untouched during switches.
+    del live_dir
+    env = _agy_subprocess_env(source_home)
 
-    with tempfile.TemporaryDirectory(prefix="agy-usage-restore-") as restore_root_str:
-        restore_root = Path(restore_root_str)
-        restore_home = restore_root / "home"
-        _copy_account_profile(runtime_home, restore_home)
-        try:
-            _copy_account_profile(source_home, runtime_home)
+    proc = subprocess.run(
+        [resolved_binary, "-p", "/usage"],
+        cwd=source_home,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    output = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
+    if proc.returncode != 0:
+        tail = "\n".join(output.splitlines()[-8:]) if output else "no output"
+        raise ValueError(f"agy /usage failed with exit code {proc.returncode}: {tail}")
 
-            env = _agy_subprocess_env(runtime_home)
-
-            proc = subprocess.run(
-                [resolved_binary, "-p", "/usage"],
-                cwd=runtime_home,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            output = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
-            if proc.returncode != 0:
-                tail = "\n".join(output.splitlines()[-8:]) if output else "no output"
-                raise ValueError(f"agy /usage failed with exit code {proc.returncode}: {tail}")
-
-            match = EMAIL_PATTERN.search(output)
-            if match:
-                return {
-                    "account_name": match.group(0),
-                    "source": "agy:/usage",
-                }
-            return {
-                "account_name": None,
-                "source": "agy:/usage",
-                "raw_hint": "\n".join(output.splitlines()[:8]),
-            }
-        finally:
-            _copy_account_profile(restore_home, runtime_home)
+    match = EMAIL_PATTERN.search(output)
+    if match:
+        return {
+            "account_name": match.group(0),
+            "source": "agy:/usage",
+        }
+    return {
+        "account_name": None,
+        "source": "agy:/usage",
+        "raw_hint": "\n".join(output.splitlines()[:8]),
+    }
 
 
 def resolve_login_profile_identity(
@@ -2149,7 +2180,9 @@ def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
     _copy_account_profile(paths.runtime_dir, live_dir.parent)
 
 
-def switch_account(paths: ManagerPaths, name: str) -> str:
+def switch_account(paths: ManagerPaths, name: str, *, force: bool = False) -> str:
+    if not force and is_agy_running():
+        raise ValueError("agy.exe is running. Exit it before switching accounts.")
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
         meta = state["accounts"].get(name)
@@ -2168,6 +2201,31 @@ def switch_account(paths: ManagerPaths, name: str) -> str:
         _sync_runtime_to_live_dir(paths, state)
         save_state(paths, state)
         return previous or ""
+
+
+def launch_account(
+    paths: ManagerPaths,
+    name: str | None = None,
+    *,
+    agy_binary: str | None = None,
+    force: bool = False,
+) -> int:
+    """Activate a saved account and run agy in the current terminal."""
+    if not force and is_agy_running():
+        raise ValueError("agy.exe is already running. Exit it before launching another account.")
+    if name:
+        switch_account(paths, name, force=force)
+    else:
+        apply_active(paths)
+    resolved_binary = resolve_agy_binary(agy_binary)
+    try:
+        return subprocess.call(
+            [resolved_binary],
+            cwd=Path.home(),
+            env=os.environ.copy(),
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(f"agy binary not found: {resolved_binary}") from exc
 
 
 def switch_next(paths: ManagerPaths) -> str:
@@ -2232,6 +2290,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "switch_policy": _state_switch_policy(state),
         "switch_runtime": _normalize_switch_runtime(state.get("switch_runtime")),
         "switch_history": _normalize_switch_history(state.get("switch_history")),
+        "log_watch": get_log_watch_snapshot(paths),
         "accounts": snapshot_accounts,
     }
 
@@ -2489,162 +2548,138 @@ def rotate_after_failure(
         raise ValueError("Cooldown minutes must be non-negative.")
 
     with manager_lock(paths):
-        state = sync_state_from_disk(paths, load_state(paths))
-        if live_dir is not None:
-            state["live_dir"] = str(live_dir.resolve())
-        switch_mode = get_switch_mode(state)
-        runtime = _normalize_switch_runtime(state.get("switch_runtime"))
-        now = utc_now()
-        now_iso = now.isoformat()
-
-        last_completed_at = parse_timestamp(runtime.get("last_completed_at"))
-        if (
-            runtime.get("status") == "ready"
-            and runtime.get("reason") == reason
-            and last_completed_at is not None
-            and (now - last_completed_at).total_seconds() <= dedupe_seconds
-            and state.get("active")
-        ):
-            _mark_switch_runtime(
-                state,
-                status="ready",
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                active=state.get("active"),
-                previous_active=runtime.get("previous_active"),
-                started_at=runtime.get("last_started_at"),
-                completed_at=runtime.get("last_completed_at"),
-            )
-            _append_switch_history(
-                state,
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                previous_active=runtime.get("previous_active"),
-                active=state.get("active"),
-                switched_to=None,
-                outcome="already_switched",
-                cooldown_minutes=0,
-                at=runtime.get("last_completed_at"),
-            )
-            save_state(paths, state)
-            return RotationResult(
-                previous_active=runtime.get("previous_active"),
-                active=state.get("active"),
-                switched_to=None,
-                marked_bad=False,
-                reason=reason,
-                cooldown_minutes=0,
-                outcome="already_switched",
-            )
-
-        previous = state.get("active")
-        _mark_switch_runtime(
-            state,
-            status="switching",
-            reason=reason,
+        return rotate_after_failure_locked(
+            paths,
+            reason,
+            cooldown_minutes=cooldown_minutes,
+            live_dir=live_dir,
+            force_switch=force_switch,
+            dedupe_seconds=dedupe_seconds,
             trigger=trigger,
             request_id=request_id,
-            active=previous,
-            previous_active=previous,
-            started_at=now_iso,
-            completed_at=None,
         )
-        save_state(paths, state)
-        if not previous:
-            _mark_switch_runtime(
-                state,
-                status="no_account",
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                active=None,
-                previous_active=None,
-                completed_at=utc_now().isoformat(),
-            )
-            _append_switch_history(
-                state,
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                previous_active=None,
-                active=None,
-                switched_to=None,
-                outcome="no_active",
-                cooldown_minutes=cooldown_minutes,
-            )
-            save_state(paths, state)
-            return RotationResult(
-                previous_active=None,
-                active=None,
-                switched_to=None,
-                marked_bad=False,
-                reason=reason,
-                cooldown_minutes=cooldown_minutes,
-                outcome="no_active",
-            )
 
-        meta = state["accounts"].get(previous)
-        if meta is None:
-            state["active"] = None
-            _mark_switch_runtime(
-                state,
-                status="no_account",
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                active=None,
-                previous_active=previous,
-                completed_at=utc_now().isoformat(),
-            )
-            _append_switch_history(
-                state,
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                previous_active=previous,
-                active=None,
-                switched_to=None,
-                outcome="active_missing",
-                cooldown_minutes=cooldown_minutes,
-            )
-            save_state(paths, state)
-            return RotationResult(
-                previous_active=previous,
-                active=None,
-                switched_to=None,
-                marked_bad=False,
-                reason=reason,
-                cooldown_minutes=cooldown_minutes,
-                outcome="active_missing",
-            )
 
-        meta["last_error"] = reason
-        meta["fail_count"] = int(meta.get("fail_count", 0)) + 1
-        if cooldown_minutes > 0:
-            meta["cooldown_until"] = (utc_now() + timedelta(minutes=cooldown_minutes)).isoformat()
-        else:
-            meta["cooldown_until"] = None
-        state["active"] = None
-        state = sync_state_from_disk(paths, state)
+def rotate_after_failure_locked(
+    paths: ManagerPaths,
+    reason: str,
+    cooldown_minutes: int = 60,
+    live_dir: Path | None = None,
+    force_switch: bool = False,
+    dedupe_seconds: int = DEFAULT_SWITCH_DEDUPE_SECONDS,
+    trigger: str = "unknown",
+    request_id: str | None = None,
+) -> RotationResult:
+    if cooldown_minutes < 0:
+        raise ValueError("Cooldown minutes must be non-negative.")
 
-        switched_to = None
-        if force_switch or switch_mode == "auto":
-            switched_to = _best_switch_candidate(paths, state, exclude=previous)
-            if switched_to:
-                _copy_active_runtime(paths, switched_to)
-                state["active"] = switched_to
-                state = sync_state_from_disk(paths, state)
-                _sync_runtime_to_live_dir(paths, state)
+    state = sync_state_from_disk(paths, load_state(paths))
+    if live_dir is not None:
+        state["live_dir"] = str(live_dir.resolve())
+    switch_mode = get_switch_mode(state)
+    runtime = _normalize_switch_runtime(state.get("switch_runtime"))
+    now = utc_now()
+    now_iso = now.isoformat()
 
+    last_completed_at = parse_timestamp(runtime.get("last_completed_at"))
+    if (
+        dedupe_seconds > 0
+        and runtime.get("status") == "ready"
+        and runtime.get("reason") == reason
+        and last_completed_at is not None
+        and (now - last_completed_at).total_seconds() <= dedupe_seconds
+        and state.get("active")
+    ):
         _mark_switch_runtime(
             state,
-            status="ready" if state.get("active") else "no_account",
+            status="ready",
             reason=reason,
             trigger=trigger,
             request_id=request_id,
             active=state.get("active"),
+            previous_active=runtime.get("previous_active"),
+            started_at=runtime.get("last_started_at"),
+            completed_at=runtime.get("last_completed_at"),
+        )
+        _append_switch_history(
+            state,
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            previous_active=runtime.get("previous_active"),
+            active=state.get("active"),
+            switched_to=None,
+            outcome="already_switched",
+            cooldown_minutes=0,
+            at=runtime.get("last_completed_at"),
+        )
+        save_state(paths, state)
+        return RotationResult(
+            previous_active=runtime.get("previous_active"),
+            active=state.get("active"),
+            switched_to=None,
+            marked_bad=False,
+            reason=reason,
+            cooldown_minutes=0,
+            outcome="already_switched",
+        )
+
+    previous = state.get("active")
+    _mark_switch_runtime(
+        state,
+        status="switching",
+        reason=reason,
+        trigger=trigger,
+        request_id=request_id,
+        active=previous,
+        previous_active=previous,
+        started_at=now_iso,
+        completed_at=None,
+    )
+    save_state(paths, state)
+    if not previous:
+        _mark_switch_runtime(
+            state,
+            status="no_account",
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            active=None,
+            previous_active=None,
+            completed_at=utc_now().isoformat(),
+        )
+        _append_switch_history(
+            state,
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            previous_active=None,
+            active=None,
+            switched_to=None,
+            outcome="no_active",
+            cooldown_minutes=cooldown_minutes,
+        )
+        save_state(paths, state)
+        return RotationResult(
+            previous_active=None,
+            active=None,
+            switched_to=None,
+            marked_bad=False,
+            reason=reason,
+            cooldown_minutes=cooldown_minutes,
+            outcome="no_active",
+        )
+
+    meta = state["accounts"].get(previous)
+    if meta is None:
+        state["active"] = None
+        _mark_switch_runtime(
+            state,
+            status="no_account",
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            active=None,
             previous_active=previous,
             completed_at=utc_now().isoformat(),
         )
@@ -2654,21 +2689,71 @@ def rotate_after_failure(
             trigger=trigger,
             request_id=request_id,
             previous_active=previous,
-            active=state.get("active"),
-            switched_to=switched_to,
-            outcome="switched" if switched_to else "no_candidate",
+            active=None,
+            switched_to=None,
+            outcome="active_missing",
             cooldown_minutes=cooldown_minutes,
         )
         save_state(paths, state)
         return RotationResult(
             previous_active=previous,
-            active=state.get("active"),
-            switched_to=switched_to,
-            marked_bad=True,
+            active=None,
+            switched_to=None,
+            marked_bad=False,
             reason=reason,
             cooldown_minutes=cooldown_minutes,
-            outcome="switched" if switched_to else "no_candidate",
+            outcome="active_missing",
         )
+
+    meta["last_error"] = reason
+    meta["fail_count"] = int(meta.get("fail_count", 0)) + 1
+    if cooldown_minutes > 0:
+        meta["cooldown_until"] = (utc_now() + timedelta(minutes=cooldown_minutes)).isoformat()
+    else:
+        meta["cooldown_until"] = None
+    state["active"] = None
+    state = sync_state_from_disk(paths, state)
+
+    switched_to = None
+    if force_switch or switch_mode == "auto":
+        switched_to = _best_switch_candidate(paths, state, exclude=previous)
+        if switched_to:
+            _copy_active_runtime(paths, switched_to)
+            state["active"] = switched_to
+            state = sync_state_from_disk(paths, state)
+            _sync_runtime_to_live_dir(paths, state)
+
+    _mark_switch_runtime(
+        state,
+        status="ready" if state.get("active") else "no_account",
+        reason=reason,
+        trigger=trigger,
+        request_id=request_id,
+        active=state.get("active"),
+        previous_active=previous,
+        completed_at=utc_now().isoformat(),
+    )
+    _append_switch_history(
+        state,
+        reason=reason,
+        trigger=trigger,
+        request_id=request_id,
+        previous_active=previous,
+        active=state.get("active"),
+        switched_to=switched_to,
+        outcome="switched" if switched_to else "no_candidate",
+        cooldown_minutes=cooldown_minutes,
+    )
+    save_state(paths, state)
+    return RotationResult(
+        previous_active=previous,
+        active=state.get("active"),
+        switched_to=switched_to,
+        marked_bad=True,
+        reason=reason,
+        cooldown_minutes=cooldown_minutes,
+        outcome="switched" if switched_to else "no_candidate",
+    )
 
 
 def login_account(
@@ -2683,93 +2768,84 @@ def login_account(
         raise ValueError("Interactive login requires a TTY.")
 
     resolved_binary = resolve_agy_binary(agy_binary)
-    with manager_lock(paths):
-        state = sync_state_from_disk(paths, load_state(paths))
-        live_dir = get_live_dir(state) or default_live_dir()
-        state["live_dir"] = str(live_dir.resolve())
-        save_state(paths, state)
+    ensure_layout(paths)
+    with tempfile.TemporaryDirectory(prefix="login-", dir=paths.root) as home_string:
+        runtime_home = Path(home_string)
+        login_dir = runtime_home / ".gemini"
+        login_dir.mkdir()
 
-    runtime_home = live_dir.parent
-    runtime_home.mkdir(parents=True, exist_ok=True)
-    _remove_managed_profile_files(live_dir)
-
-    env = _agy_subprocess_env(runtime_home)
-    try:
-        proc = subprocess.Popen(
-            [resolved_binary],
-            stdin=sys.stdin,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-            cwd=runtime_home,
-            env=env,
-            close_fds=True,
-        )
-    except FileNotFoundError as exc:
-        raise ValueError(f"agy binary not found: {resolved_binary}") from exc
-
-    start_time = time.time()
-    print("Launching real agy login session.")
-    print("Complete onboarding/login there, then exit agy to save the profile.")
-    sys.stdout.flush()
-    try:
-        while True:
-            if proc.poll() is not None:
-                break
-            if time.time() - start_time > timeout_seconds:
+        env = _agy_subprocess_env(runtime_home)
+        try:
+            proc = subprocess.Popen(
+                [resolved_binary],
+                stdin=sys.stdin,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                cwd=runtime_home,
+                env=env,
+                close_fds=True,
+            )
+        except FileNotFoundError as exc:
+            raise ValueError(f"agy binary not found: {resolved_binary}") from exc
+        start_time = time.time()
+        print("Launching real agy login session.")
+        print("Complete onboarding/login there, then exit agy to save the profile.")
+        sys.stdout.flush()
+        try:
+            while True:
+                if proc.poll() is not None:
+                    break
+                if time.time() - start_time > timeout_seconds:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        raise
+            raise
 
-    if not live_dir.is_dir() or not (
-        profile_has_login_artifacts(live_dir) or _windows_active_credential_exists()
-    ):
-        raise ValueError("agy login did not produce a usable auth profile.")
+        if not profile_has_login_artifacts(login_dir) and not _windows_active_credential_exists():
+            raise ValueError("agy login did not produce a usable auth profile.")
 
-    identity = resolve_login_profile_identity(live_dir, agy_binary=resolved_binary, live_dir=live_dir)
-    detected_name = identity.get("account_name")
-    # The caller's name is the stable profile label.  Keep detected identity
-    # as metadata so two profiles from the same or changing login identity do
-    # not collapse onto one storage directory.
-    storage_name = normalize_account_storage_name(name)
-    if detected_name and storage_name != name:
-        print(f"detected-account: {detected_name}")
-        print(f"storage-name: {storage_name}")
+        identity = resolve_login_profile_identity(login_dir, agy_binary=resolved_binary, live_dir=login_dir)
+        detected_name = identity.get("account_name")
+        # The caller's name is the stable profile label. Keep detected identity
+        # as metadata so multiple profiles never collapse onto one directory.
+        storage_name = normalize_account_storage_name(name)
+        if detected_name and storage_name != name:
+            print(f"detected-account: {detected_name}")
+            print(f"storage-name: {storage_name}")
 
-    overwrite = False
-    if account_dir(paths, storage_name).exists():
-        prompt = f"Account '{storage_name}' already exists. Overwrite it? [y/N]: "
-        answer = input(prompt).strip().lower()
-        if answer not in {"y", "yes"}:
-            storage_name = next_available_account_name(paths, storage_name)
-            print(f"saving-as: {storage_name}")
-        else:
-            overwrite = True
+        overwrite = False
+        if account_dir(paths, storage_name).exists():
+            prompt = f"Account '{storage_name}' already exists. Overwrite it? [y/N]: "
+            answer = input(prompt).strip().lower()
+            if answer not in {"y", "yes"}:
+                storage_name = next_available_account_name(paths, storage_name)
+                print(f"saving-as: {storage_name}")
+            else:
+                overwrite = True
 
-    save_account_profile(
-        paths,
-        storage_name,
-        runtime_home,
-        overwrite=overwrite,
-        capture_windows_credential=os.name == "nt",
-    )
-    return storage_name
+        save_account_profile(
+            paths,
+            storage_name,
+            runtime_home,
+            overwrite=overwrite,
+            capture_windows_credential=os.name == "nt",
+        )
+        return storage_name
 
 
 def format_status(paths: ManagerPaths) -> str:
     state = sync_state_from_disk(paths, load_state(paths))
-    save_state(paths, state)
     switch_runtime = _normalize_switch_runtime(state.get("switch_runtime"))
     switch_history = _normalize_switch_history(state.get("switch_history"))
     lines = [

@@ -28,6 +28,7 @@ from agy_cli_manager.manager import (
     import_current,
     list_account_proxies,
     list_models,
+    launch_account,
     login_account,
     load_state,
     mark_bad,
@@ -46,6 +47,12 @@ from agy_cli_manager.manager import (
     update_switch_policy,
     update_account_runtime_metadata,
     verify_accounts,
+)
+from agy_cli_manager.watch import (
+    clear_restart_required,
+    format_watch_poll,
+    poll_quota_logs,
+    watch_quota_logs,
 )
 
 def build_parser() -> argparse.ArgumentParser:
@@ -133,8 +140,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     switch = sub.add_parser("switch", help="Switch to a named account")
     switch.add_argument("name")
+    switch.add_argument("--force", action="store_true", help="Switch even when agy.exe appears to be running")
     activate = sub.add_parser("activate", help="Alias for switch")
     activate.add_argument("name")
+    activate.add_argument("--force", action="store_true", help="Switch even when agy.exe appears to be running")
+    launch = sub.add_parser("launch", help="Activate an account and launch agy in this terminal")
+    launch.add_argument("name", nargs="?", help="Saved account name; defaults to the active account")
+    launch.add_argument("--agy-binary")
+    launch.add_argument("--force", action="store_true", help="Launch even when agy.exe appears to be running")
 
     sub.add_parser("switch-next", help="Switch to the next enabled standby account")
     rotate_cmd = sub.add_parser("rotate", help="Alias for switch-next")
@@ -165,6 +178,22 @@ def build_parser() -> argparse.ArgumentParser:
     rotate.add_argument("--live-dir")
     rotate.add_argument("--force-switch", action="store_true", help="Switch even if the manager is in manual mode")
     rotate.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    watch = sub.add_parser("watch", help="Watch Antigravity CLI logs and fail over on quota errors")
+    watch.add_argument("--once", action="store_true", help="Scan newly appended log bytes once and exit")
+    watch.add_argument("--from-start", action="store_true", help="Read existing log bytes from offset 0 instead of skipping history")
+    watch.add_argument("--poll-seconds", type=float, default=1.0, help="Follow poll interval in seconds")
+    watch.add_argument("--no-rotate", action="store_true", help="Detect quota errors without calling rotate-after-failure")
+    watch.add_argument("--force-switch", action="store_true", help="Switch even if the manager is in manual mode")
+    watch.add_argument("--cooldown-minutes", type=int, default=60)
+    watch.add_argument("--on-rotate", help="Shell command to run after a successful switch")
+    watch.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    ack_restart = sub.add_parser(
+        "ack-restart",
+        help="Acknowledge that agy was restarted after a log-watch account switch",
+    )
+    ack_restart.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     update_meta = sub.add_parser("update-meta", help="Update cached runtime metadata for an account")
     update_meta.add_argument("name")
@@ -749,6 +778,7 @@ def _draw_action_bar(stdscr, y: int) -> int:
         ("C", "ClearBad"),
         ("M", "MarkBad"),
         ("W", "Mode"),
+        ("Y", "AckRestart"),
         ("S", "Sort"),
         ("U", "Live Usage Refresh"),
         ("T", "UI Refresh"),
@@ -1362,6 +1392,8 @@ def _dashboard(stdscr, paths) -> int:
     refresh_thread: threading.Thread | None = None
     refresh_inflight_name: str | None = None
     refresh_backoff_until: dict[str, float] = {}
+    last_log_poll = 0.0
+    log_watch_started_at = time.time()
 
     while True:
         try:
@@ -1426,6 +1458,7 @@ def _dashboard(stdscr, paths) -> int:
             f" | UI Refresh: {interval}s"
             f" | Sort: {sort_mode_name}"
             f" | Switch: {snapshot.get('switch_mode') or 'auto'}"
+            f" | LogWatch: {'restart agy' if (snapshot.get('log_watch') or {}).get('restart_required') else 'on'}"
             " | Live Status: Auto+Manual"
         )
         top_lines = _draw_wrapped_lines(stdscr, 0, top, _color_attr(COLOR_HEADER, curses.A_BOLD))
@@ -1550,6 +1583,22 @@ def _dashboard(stdscr, paths) -> int:
                 refresh_inflight_name = auto_target_name
                 message = f"Background refreshing {auto_target_name}..."
 
+        if now - last_log_poll >= 1.0:
+            last_log_poll = now
+            try:
+                watch_result = poll_quota_logs(
+                    paths,
+                    started_at=log_watch_started_at,
+                    rotate=True,
+                )
+            except ValueError as exc:
+                message = f"Log-watch error: {exc}"
+            else:
+                if watch_result.events or watch_result.rotated:
+                    snapshot = _refresh_dashboard_snapshot(paths)
+                    last_refresh = time.time()
+                    message = format_watch_poll(watch_result)
+
         try:
             key = stdscr.getch()
         except KeyboardInterrupt:
@@ -1593,6 +1642,12 @@ def _dashboard(stdscr, paths) -> int:
             continue
         if key in (ord("p"), ord("P")):
             return _proxy_dashboard(stdscr, paths)
+        if key in (ord("y"), ord("Y")):
+            clear_restart_required(paths)
+            snapshot = _refresh_dashboard_snapshot(paths)
+            last_refresh = time.time()
+            message = "Acknowledged agy restart; log-watch can rotate again."
+            continue
         if not accounts:
             message = "No accounts available for this action."
             continue
@@ -2061,19 +2116,26 @@ def main() -> int:
             print(f"{'logged-in' if stored_name else 'cancelled'}: {stored_name or name}")
             return 0
         if args.command == "switch":
-            previous = switch_account(paths, args.name)
+            previous = switch_account(paths, args.name, force=args.force)
             if previous:
                 print(f"switched: {previous} -> {args.name}")
             else:
                 print(f"switched: {args.name}")
             return 0
         if args.command == "activate":
-            previous = switch_account(paths, args.name)
+            previous = switch_account(paths, args.name, force=args.force)
             if previous:
                 print(f"activated: {previous} -> {args.name}")
             else:
                 print(f"activated: {args.name}")
             return 0
+        if args.command == "launch":
+            return launch_account(
+                paths,
+                args.name,
+                agy_binary=args.agy_binary,
+                force=args.force,
+            )
         if args.command == "switch-next":
             target = switch_next(paths)
             print(f"switched-next: {target}")
@@ -2143,6 +2205,30 @@ def main() -> int:
                 else:
                     print("no-active-account")
             return 0
+        if args.command == "ack-restart":
+            state = clear_restart_required(paths)
+            if args.json:
+                print(json.dumps({
+                    "restart_required": bool(state.get("restart_required")),
+                    "restart_armed_at": state.get("restart_armed_at"),
+                    "restart_armed_account": state.get("restart_armed_account"),
+                }, indent=2, sort_keys=True))
+            else:
+                print("restart-acknowledged")
+            return 0
+        if args.command == "watch":
+            return watch_quota_logs(
+                paths,
+                follow=not args.once,
+                once=args.once,
+                from_start=args.from_start,
+                poll_seconds=args.poll_seconds,
+                rotate=not args.no_rotate,
+                force_switch=args.force_switch,
+                cooldown_minutes=args.cooldown_minutes,
+                on_rotate=args.on_rotate,
+                as_json=args.json,
+            )
         if args.command == "update-meta":
             meta = update_account_runtime_metadata(
                 paths,

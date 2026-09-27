@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - feature/windows-support
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.10"
+          - "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Upgrade packaging tools
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install project
+        run: python -m pip install .
+
+      - name: Compile Python sources
+        run: python -m compileall -q src
+
+      - name: Run tests when present
+        run: >-
+          python -c "import pathlib, subprocess, sys;
+          tests = pathlib.Path('tests');
+          print('No tests directory; skipping unittest discovery.') if not tests.is_dir() else None;
+          raise SystemExit(subprocess.call([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v']) if tests.is_dir() else 0)"
+
+      - name: Smoke-test installed CLI
+        run: agy-cli-manager --help
+
+  build:
+    name: Build distributions
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install build frontend
+        run: python -m pip install --upgrade pip build
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Verify built wheel installs
+        run: |
+          python -m pip install --force-reinstall dist/*.whl
+          agy-cli-manager --help
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: agy-cli-manager-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-exe:
+    name: Build Windows executable
+    needs: test
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install project and PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller .
+
+      - name: Build self-contained executable
+        run: >-
+          pyinstaller --onefile --name agy-cli-manager
+          --paths src
+          src/agy_cli_manager/__main__.py
+
+      - name: Smoke-test executable
+        run: .\dist\agy-cli-manager.exe --help
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: agy-cli-manager-windows-x64
+          path: dist/agy-cli-manager.exe
+          if-no-files-found: error
+          retention-days: 14
