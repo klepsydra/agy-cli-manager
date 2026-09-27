@@ -404,8 +404,9 @@ class LogWatchIntegrationTests(unittest.TestCase):
             self.assertFalse(final.rotated)
             state = load_log_watch_state(paths.root)
             payload = json.loads(log_watch_state_path(paths.root).read_text(encoding="utf-8"))
-            self.assertEqual(payload["cursors"][str(log_path)]["offset"], log_path.stat().st_size)
-            self.assertEqual(state["cursors"][str(log_path)]["offset"], log_path.stat().st_size)
+            cursor_key = str(log_path.resolve())
+            self.assertEqual(payload["cursors"][cursor_key]["offset"], log_path.stat().st_size)
+            self.assertEqual(state["cursors"][cursor_key]["offset"], log_path.stat().st_size)
 
     def test_empty_init_then_first_quota_log_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -432,7 +433,7 @@ class LogWatchIntegrationTests(unittest.TestCase):
             second = poll_quota_logs(paths, rotate=True)
             self.assertEqual(len(second.events), 1)
             self.assertEqual(second.events[0].kind, "individual_quota")
-            self.assertEqual(second.events[0].path, str(log_path))
+            self.assertEqual(Path(second.events[0].path).resolve(), log_path.resolve())
             self.assertTrue(second.rotated)
             self.assertEqual(second.rotation.previous_active, "account-a")
             self.assertEqual(second.rotation.switched_to, "account-b")

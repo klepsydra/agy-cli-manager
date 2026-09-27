@@ -129,7 +129,10 @@ class ManagerRegressionTests(unittest.TestCase):
         self.add("b")
 
         def run_probe(*args, **kwargs):
-            self.assertEqual(kwargs["env"]["HOME"], str(m.account_dir(self.paths, "b")))
+            self.assertEqual(
+                Path(kwargs["env"]["HOME"]).resolve(),
+                m.account_dir(self.paths, "b").resolve(),
+            )
             m.switch_account(self.paths, "b")
             return subprocess.CompletedProcess(args[0], 0, "b@example.com", "")
 

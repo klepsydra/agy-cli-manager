@@ -58,7 +58,11 @@ class WindowsLauncherTests(unittest.TestCase):
         token = replacement / TOKEN_PATH
         token.parent.mkdir(parents=True)
         token.write_text("new-token", encoding="utf-8")
-        m.import_current(self.paths, "work", replacement, overwrite=True)
+        with mock.patch.object(m, "_windows_active_credential_exists", return_value=True), \
+             mock.patch.object(m, "_windows_capture_active_credential", return_value=True), \
+             mock.patch.object(m, "_windows_profile_has_credential", return_value=True), \
+             mock.patch.object(m, "_windows_activate_credential", return_value=True):
+            m.import_current(self.paths, "work", replacement, overwrite=True)
         saved = m.account_dir(self.paths, "work") / TOKEN_PATH
         self.assertEqual(saved.read_text(encoding="utf-8"), "new-token")
 
