@@ -137,7 +137,8 @@ class ManagerRegressionTests(unittest.TestCase):
             return subprocess.CompletedProcess(args[0], 0, "b@example.com", "")
 
         with mock.patch.object(m, "resolve_agy_binary", return_value="agy"), \
-             mock.patch.object(m.subprocess, "run", side_effect=run_probe):
+             mock.patch.object(m.subprocess, "run", side_effect=run_probe), \
+             mock.patch.object(m, "is_agy_running", return_value=False):
             identity = m.probe_profile_identity_via_usage(m.account_dir(self.paths, "b"))
         self.assertEqual(identity["account_name"], "b@example.com")
         self.assertEqual(self.token(self.live_home).read_text(encoding="utf-8"), "token-b")
