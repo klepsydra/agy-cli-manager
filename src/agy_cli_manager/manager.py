@@ -875,27 +875,31 @@ def _eligible_switch_candidates(state: dict, exclude: str | None = None) -> list
 def _is_short_window_exhausted(meta: dict, now: datetime | None = None, *, threshold_percent: float = DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT) -> bool:
     current = now or utc_now()
     windows = _normalize_usage_windows(meta)
-    short = windows.get("short", {})
-    if short.get("status") != "known":
-        return False
-    value = _coerce_usage_value(short.get("value"))
-    if value is None or value > threshold_percent:
-        return False
-    reset_at = parse_timestamp(short.get("reset_at"))
-    if reset_at is not None and reset_at <= current:
-        return False
-    return True
+    for window_name in ("short", "weekly"):
+        window = windows.get(window_name, {})
+        if window.get("status") != "known":
+            continue
+        value = _coerce_usage_value(window.get("value"))
+        if value is not None and value <= threshold_percent:
+            reset_at = parse_timestamp(window.get("reset_at"))
+            if reset_at is None or reset_at > current:
+                return True
+    return False
 
 
 def _cooldown_minutes_from_short_window(meta: dict, now: datetime | None = None) -> int:
     current = now or utc_now()
     windows = _normalize_usage_windows(meta)
-    short = windows.get("short", {})
-    reset_at = parse_timestamp(short.get("reset_at"))
-    if reset_at is None or reset_at <= current:
-        return 60
-    delta_seconds = max(60.0, (reset_at - current).total_seconds())
-    return max(1, int(math.ceil(delta_seconds / 60.0)))
+    for window_name in ("short", "weekly"):
+        window = windows.get(window_name, {})
+        if window.get("status") == "known":
+            value = _coerce_usage_value(window.get("value"))
+            if value is not None and value <= DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT:
+                reset_at = parse_timestamp(window.get("reset_at"))
+                if reset_at is not None and reset_at > current:
+                    delta_seconds = max(60.0, (reset_at - current).total_seconds())
+                    return max(1, int(math.ceil(delta_seconds / 60.0)))
+    return 60
 
 
 def _refresh_failure_threshold_reached(meta: dict, threshold: int = DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD) -> bool:
@@ -960,11 +964,14 @@ def _best_switch_candidate(paths: ManagerPaths, state: dict, *, exclude: str | N
         short_known = short_value is not None
         short_low = short_known and short_value <= threshold_percent
         weekly_known = weekly_value is not None
+        weekly_low = weekly_known and weekly_value <= threshold_percent
+        is_low = short_low or weekly_low
 
         if strategy == "highest-short":
             score = (
-                0 if short_known else 1,
-                -(short_value if short_value is not None else -1.0),
+                1 if is_low else 0,
+                0 if short_known else (0 if weekly_known else 1),
+                -(short_value if short_known else (weekly_value if weekly_known else -1.0)),
                 _candidate_health_priority(health),
                 int(meta.get("refresh_fail_count", 0) or 0),
                 int(meta.get("fail_count", 0) or 0),
@@ -974,17 +981,17 @@ def _best_switch_candidate(paths: ManagerPaths, state: dict, *, exclude: str | N
         elif strategy == "round-robin":
             score = (
                 _candidate_health_priority(health),
-                0 if short_known and not short_low else 1,
+                1 if is_low else 0,
                 str(meta.get("created_at") or ""),
                 name.lower(),
             )
         else:
             score = (
                 _candidate_health_priority(health),
-                0 if short_known and not short_low else 1,
-                0 if short_known else 1,
+                1 if is_low else 0,
+                0 if (short_known and not short_low) else 1,
                 -(short_value if short_value is not None else -1.0),
-                0 if weekly_known else 1,
+                0 if (weekly_known and not weekly_low) else 1,
                 -(weekly_value if weekly_value is not None else -1.0),
                 int(meta.get("refresh_fail_count", 0) or 0),
                 int(meta.get("fail_count", 0) or 0),

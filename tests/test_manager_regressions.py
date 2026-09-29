@@ -187,3 +187,28 @@ class ManagerRegressionTests(unittest.TestCase):
         self.assertEqual(m.load_state(self.paths)["active"], "a")
         self.assertEqual(self.token(self.live_home).read_text(encoding="utf-8"), "token-a")
         self.assertEqual(self.token(m.account_dir(self.paths, "b")).read_text(encoding="utf-8"), "token-b")
+
+    def test_weekly_window_exhaustion_triggers_failover(self) -> None:
+        self.add("a")
+        self.add("b")
+        # Mark "a" active with 0% weekly quota remaining
+        m.update_account_runtime_metadata(
+            self.paths,
+            "a",
+            weekly_usage_status="known",
+            weekly_usage_value=0.0,
+            weekly_reset_at="2026-10-01T12:00:00+00:00",
+        )
+        m.update_account_runtime_metadata(
+            self.paths,
+            "b",
+            weekly_usage_status="known",
+            weekly_usage_value=100.0,
+        )
+        m.switch_account(self.paths, "a")
+        m.set_switch_mode(self.paths, "auto")
+        result = m.ensure_active_account(self.paths)
+        self.assertTrue(result.triggered)
+        self.assertEqual(result.switched_to, "b")
+        self.assertEqual(result.reason, "quota_exhausted")
+        self.assertEqual(m.load_state(self.paths)["active"], "b")
