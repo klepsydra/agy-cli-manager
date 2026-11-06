@@ -13,6 +13,16 @@ MANAGER_REPO="$HOME/agy-cli-manager"
 TOKENS_REPO="$HOME/agy-tokens-and-settings"
 LOCAL_BIN="$HOME/.local/bin"
 DEPLOY_BIN="$LOCAL_BIN/agy-deploy"
+
+# Customizable settings live in ~/.config/agy-deploy.conf (created on first run).
+#   AGY_AUTO_UPDATE=on|off   check both klepsydra repos on GitHub and merge down
+#   AGY_AUTO_UPDATE_DAYS=7   how often (days) the automatic check runs
+AGY_CONF="${AGY_DEPLOY_CONF:-$HOME/.config/agy-deploy.conf}"
+AGY_AUTO_UPDATE="${AGY_AUTO_UPDATE:-on}"
+AGY_AUTO_UPDATE_DAYS="${AGY_AUTO_UPDATE_DAYS:-7}"
+# shellcheck disable=SC1090
+[[ -r "$AGY_CONF" ]] && . "$AGY_CONF"
+UPDATE_STAMP="$MANAGER_ROOT/last-repo-update"
 export PATH="$LOCAL_BIN:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:$PATH"
 export AGY_BINARY="${AGY_BINARY:-$LOCAL_BIN/agy}"
 ERRORS=0
@@ -178,9 +188,10 @@ update_repo() {
   if [[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]]; then
     record_error "$path has local changes; left it untouched instead of pulling over them"; return
   fi
-  if ! git -C "$path" checkout main || ! git -C "$path" fetch origin main; then record_error "Could not fetch origin/main in $path"; return; fi
-  if ! git -C "$path" merge --ff-only origin/main; then record_error "Could not fast-forward $path from origin/main"; return; fi
+  if ! git -C "$path" checkout -q main; then record_error "Could not check out main in $path"; return; fi
   if [[ "$is_manager" == yes ]]; then
+    if ! git -C "$path" fetch origin main; then record_error "Could not fetch origin/main in $path"; return; fi
+    if ! git -C "$path" merge --ff-only origin/main; then record_error "Could not fast-forward $path from origin/main"; return; fi
     if git -C "$path" fetch upstream main; then
       if ! git -C "$path" merge --no-edit upstream/main; then
         git -C "$path" merge --abort >/dev/null 2>&1 || true
@@ -190,8 +201,47 @@ update_repo() {
     else
       record_error "Could not fetch zcop upstream for $path"; return
     fi
+    # Publish only when the fork is actually ahead (e.g. after an upstream merge).
+    if [[ "$(git -C "$path" rev-list --count origin/main..HEAD 2>/dev/null)" != 0 ]]; then
+      git -C "$path" push origin main || record_error "Could not push updated main for $path"
+    fi
+  else
+    # Tokens repo: conflict-aware merge (fresher token wins, accounts unioned).
+    if [[ -f "$path/agy_sync_tools.py" ]]; then
+      python3 "$path/agy_sync_tools.py" merge --repo "$path" || record_error "Could not merge origin/main into $path"
+    else
+      git -C "$path" fetch origin main && git -C "$path" merge --ff-only origin/main || record_error "Could not fast-forward $path"
+    fi
   fi
-  if ! git -C "$path" push origin main; then record_error "Could not push updated main for $path"; fi
+}
+
+write_default_config() {
+  [[ -e "$AGY_CONF" ]] && return 0
+  mkdir -p "$(dirname "$AGY_CONF")"
+  cat > "$AGY_CONF" <<'EOF'
+# agy-deploy settings (shell syntax). Delete a line to restore its default.
+# Check both klepsydra repos on GitHub and merge updates down: on or off.
+AGY_AUTO_UPDATE=on
+# Days between automatic update checks.
+AGY_AUTO_UPDATE_DAYS=7
+EOF
+}
+
+# Run by the 10-minute refresh job: only does work once AGY_AUTO_UPDATE_DAYS
+# have passed since the last successful check (and only when enabled).
+auto_update_repos() {
+  local force="${1:-}"
+  if [[ "${AGY_AUTO_UPDATE,,}" != on ]]; then say "Repo auto-update is off (AGY_AUTO_UPDATE=$AGY_AUTO_UPDATE)"; return 0; fi
+  local days="$AGY_AUTO_UPDATE_DAYS" last now
+  [[ "$days" =~ ^[0-9]+$ ]] || days=7
+  now="$(date +%s)"; last="$(cat "$UPDATE_STAMP" 2>/dev/null || echo 0)"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if [[ "$force" != force ]] && (( now - last < days * 86400 )); then return 0; fi
+  say "Auto-update due (every $days day(s)): checking both klepsydra repos"
+  local before=$ERRORS
+  update_repo "$MANAGER_REPO" yes
+  update_repo "$TOKENS_REPO" no
+  if (( ERRORS == before )); then mkdir -p "$MANAGER_ROOT"; date +%s > "$UPDATE_STAMP"; fi
 }
 
 ensure_toolchain() {
@@ -318,7 +368,7 @@ configure_manager() {
 }
 
 install_services() {
-  local service_dir="$HOME/.config/systemd/user" cron_file tmp profile
+  local service_dir="$HOME/.config/systemd/user" tmp profile
   mkdir -p "$service_dir" "$LOCAL_BIN"
   cat > "$service_dir/agy-cli-manager-watch.service" <<EOF
 [Unit]
@@ -434,6 +484,7 @@ EOF
 refresh_accounts() {
   local manager_bin="$LOCAL_BIN/agy-cli-manager"
   [[ -x "$manager_bin" ]] || { record_error "agy-cli-manager is unavailable for refresh"; return; }
+  auto_update_repos
   step "Poll new quota log lines and rotate on a quota error" "$manager_bin" watch --once --json
   step "Refresh the next due account quota" "$manager_bin" refresh-due --json
   step "Proactively ensure usable Gemini quota" "$manager_bin" ensure-active --family gemini --json
@@ -443,11 +494,13 @@ refresh_accounts() {
 
 local_deploy() {
   say "Deploying AGY manager for $(id -un) on $(hostname -s)"
+  write_default_config
   install_system_dependencies
   ensure_repo "$MANAGER_REPO" "$MANAGER_URL" "$MANAGER_UPSTREAM_URL"
   ensure_repo "$TOKENS_REPO" "$TOKENS_URL"
   update_repo "$MANAGER_REPO" yes
   update_repo "$TOKENS_REPO" no
+  if ((ERRORS == 0)); then mkdir -p "$MANAGER_ROOT"; date +%s > "$UPDATE_STAMP"; fi
   ensure_toolchain
   ensure_agy_cli
   configure_manager
@@ -459,11 +512,11 @@ local_deploy() {
 }
 
 maintain() {
+  write_default_config
   install_system_dependencies
   ensure_repo "$MANAGER_REPO" "$MANAGER_URL" "$MANAGER_UPSTREAM_URL"
   ensure_repo "$TOKENS_REPO" "$TOKENS_URL"
-  update_repo "$MANAGER_REPO" yes
-  update_repo "$TOKENS_REPO" no
+  auto_update_repos force
   ensure_toolchain
   ensure_agy_cli
   configure_manager
