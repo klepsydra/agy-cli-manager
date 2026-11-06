@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Idempotent AGY account-manager bootstrap and maintenance.
-# Usage: ./command.sh user@targetHost
+# Usage: ./agy-deploy.sh user@targetHost
 # Modes used by installed services: --local, --maintain, --refresh, --watch
 set -uo pipefail
 
@@ -180,7 +180,7 @@ EOF
   chmod 755 "$LOCAL_BIN/agy-cli-manager"
   cat > "$DEPLOY_BIN" <<'EOF'
 #!/usr/bin/env bash
-exec bash "$HOME/agy-tokens-and-settings/command.sh" "$@"
+exec bash "$HOME/agy-tokens-and-settings/agy-deploy.sh" "$@"
 EOF
   chmod 755 "$DEPLOY_BIN"
   local shell_file
@@ -400,8 +400,8 @@ case "${1:-}" in
   *)
     cat >&2 <<'USAGE'
 Usage:
-  ./command.sh user@targetHost   Bootstrap/update a local or SSH target
-  ./command.sh --local           Deploy on the current Linux user
+  ./agy-deploy.sh user@targetHost   Bootstrap/update a local or SSH target
+  ./agy-deploy.sh --local           Deploy on the current Linux user
 
 Service modes are installed automatically: --watch, --refresh, --maintain.
 USAGE
