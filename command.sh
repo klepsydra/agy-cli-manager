@@ -13,6 +13,8 @@ MANAGER_REPO="$HOME/agy-cli-manager"
 TOKENS_REPO="$HOME/agy-tokens-and-settings"
 LOCAL_BIN="$HOME/.local/bin"
 DEPLOY_BIN="$LOCAL_BIN/agy-deploy"
+export PATH="$LOCAL_BIN:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:$PATH"
+export AGY_BINARY="${AGY_BINARY:-$LOCAL_BIN/agy}"
 ERRORS=0
 
 say() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
@@ -144,6 +146,14 @@ ensure_toolchain() {
   local mise_bin="$LOCAL_BIN/mise"
   [[ -x "$mise_bin" ]] || mise_bin="$(command -v mise)"
   step "Update mise" "$mise_bin" self-update -y
+  mkdir -p "$HOME/.config/mise/conf.d"
+  cat > "$HOME/.config/mise/conf.d/agy-tools.toml" <<'EOF'
+[tools]
+python = "latest"
+uv = "latest"
+ruby = "latest"
+bun = "latest"
+EOF
   # Install user-local language runtimes/package managers only; no system
   # Python/Ruby/Bun installation is changed.
   local tool
@@ -173,6 +183,19 @@ EOF
 exec bash "$HOME/agy-tokens-and-settings/command.sh" "$@"
 EOF
   chmod 755 "$DEPLOY_BIN"
+  local shell_file
+  for shell_file in "$HOME/.bashrc" "$HOME/.profile"; do
+    if ! grep -q 'AGY-DEPLOY-MISE' "$shell_file" 2>/dev/null; then
+      cat >> "$shell_file" <<'EOF'
+
+# BEGIN AGY-DEPLOY-MISE
+if [ -x "$HOME/.local/bin/mise" ]; then
+  eval "$("$HOME/.local/bin/mise" activate bash)"
+fi
+# END AGY-DEPLOY-MISE
+EOF
+    fi
+  done
 }
 
 private_tokens_repo() {
@@ -203,6 +226,7 @@ configure_manager() {
     record_error "sync-down.sh is missing from $TOKENS_REPO"
   fi
   step "Set the live Antigravity home" "$manager_bin" set-live-dir "$LIVE_DIR"
+  step "Apply the manager's active account to the live profile" "$manager_bin" apply-active
   step "Enable automatic account switching" "$manager_bin" switch-mode auto
   step "Set balanced proactive quota thresholds" "$manager_bin" switch-policy --gemini-threshold 10 --other-threshold 10 --refresh-failure-threshold 2 --candidate-strategy balanced
   step "Select automatic credential backend" "$manager_bin" credential-backend auto
@@ -220,6 +244,8 @@ After=default.target
 [Service]
 Type=simple
 ExecStart=$LOCAL_BIN/agy-deploy --watch
+Environment=PATH=$LOCAL_BIN:/usr/local/bin:/usr/bin:/bin
+Environment=AGY_BINARY=$AGY_BINARY
 Restart=always
 RestartSec=5
 
@@ -233,6 +259,8 @@ Description=Refresh AGY account quotas and proactively select a usable account
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/flock -n $MANAGER_ROOT/refresh.lock $LOCAL_BIN/agy-deploy --refresh
+Environment=PATH=$LOCAL_BIN:/usr/local/bin:/usr/bin:/bin
+Environment=AGY_BINARY=$AGY_BINARY
 EOF
   cat > "$service_dir/agy-account-refresh.timer" <<'EOF'
 [Unit]
@@ -254,6 +282,8 @@ Description=Update AGY manager, tools, accounts, and settings
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/flock -n $MANAGER_ROOT/maintenance.lock $LOCAL_BIN/agy-deploy --maintain
+Environment=PATH=$LOCAL_BIN:/usr/local/bin:/usr/bin:/bin
+Environment=AGY_BINARY=$AGY_BINARY
 EOF
   cat > "$service_dir/agy-maintain.timer" <<'EOF'
 [Unit]
@@ -330,7 +360,6 @@ refresh_accounts() {
 local_deploy() {
   say "Deploying AGY manager for $(id -un) on $(hostname -s)"
   install_system_dependencies
-  ensure_toolchain
   ensure_repo "$MANAGER_REPO" "$MANAGER_URL" "$MANAGER_UPSTREAM_URL"
   ensure_repo "$TOKENS_REPO" "$TOKENS_URL"
   update_repo "$MANAGER_REPO" yes
