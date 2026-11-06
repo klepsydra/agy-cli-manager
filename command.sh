@@ -362,7 +362,7 @@ case "${1:-}" in
   --refresh) refresh_accounts ;;
   --watch) exec "$LOCAL_BIN/agy-cli-manager" watch ;;
   --start-watch) exec "$LOCAL_BIN/agy-watch-start" ;;
-  user@*) remote_bootstrap "$1" ;;
+  *@*) remote_bootstrap "$1" ;;
   *)
     cat >&2 <<'USAGE'
 Usage:
