@@ -185,10 +185,15 @@ EOF
   chmod 755 "$DEPLOY_BIN"
   local shell_file
   for shell_file in "$HOME/.bashrc" "$HOME/.profile"; do
-    if ! grep -q 'AGY-DEPLOY-MISE' "$shell_file" 2>/dev/null; then
+    if grep -q 'AGY-DEPLOY-MISE' "$shell_file" 2>/dev/null; then
+      if ! grep -q 'AGY-DEPLOY-MISE-PATH' "$shell_file"; then
+        sed -i '/# BEGIN AGY-DEPLOY-MISE/a export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH" # AGY-DEPLOY-MISE-PATH' "$shell_file"
+      fi
+    else
       cat >> "$shell_file" <<'EOF'
 
 # BEGIN AGY-DEPLOY-MISE
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH" # AGY-DEPLOY-MISE-PATH
 if [ -x "$HOME/.local/bin/mise" ]; then
   eval "$("$HOME/.local/bin/mise" activate bash)"
 fi
