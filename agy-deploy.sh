@@ -263,6 +263,25 @@ EOF
   done
 }
 
+ensure_agy_cli() {
+  local binary="$AGY_BINARY"
+  if [[ -x "$binary" ]] && "$binary" --version >/dev/null 2>&1; then
+    ok "AGY CLI already installed at $binary"
+    return
+  fi
+  command -v curl >/dev/null 2>&1 || { record_error "curl is required to install the AGY CLI"; return; }
+  say "Install the Google Antigravity CLI (agy)"
+  if ! curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --skip-path; then
+    record_error "Official AGY CLI installer failed"
+    return
+  fi
+  if [[ -x "$binary" ]] && "$binary" --version >/dev/null 2>&1; then
+    ok "Installed AGY CLI at $binary"
+  else
+    record_error "AGY installer completed, but $binary is missing or not executable"
+  fi
+}
+
 private_tokens_repo() {
   command -v gh >/dev/null 2>&1 || return 1
   gh auth status >/dev/null 2>&1 || return 1
@@ -430,6 +449,7 @@ local_deploy() {
   update_repo "$MANAGER_REPO" yes
   update_repo "$TOKENS_REPO" no
   ensure_toolchain
+  ensure_agy_cli
   configure_manager
   install_services
   refresh_accounts
@@ -445,6 +465,7 @@ maintain() {
   update_repo "$MANAGER_REPO" yes
   update_repo "$TOKENS_REPO" no
   ensure_toolchain
+  ensure_agy_cli
   configure_manager
   refresh_accounts
   if ((ERRORS)); then warn "Maintenance completed with $ERRORS recoverable issue(s)."; return 1; fi
