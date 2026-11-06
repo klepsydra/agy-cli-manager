@@ -84,7 +84,7 @@ transfer_remote_glab_identity() {
   source_token="$(awk -F": " 'tolower($1) ~ /token/ {print $2; exit}' <<<"$status")"
   unset status
   [[ -n "$source_token" ]] || { warn "Source glab did not expose a GitLab.com token"; return 0; }
-  if ssh -o ConnectTimeout=7 "$remote" 'glab auth status --hostname gitlab.com >/dev/null 2>&1'; then
+  if ssh -o ConnectTimeout=7 "$remote" 'export PATH=$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin; glab auth status --hostname gitlab.com >/dev/null 2>&1'; then
     unset source_token
     ok "Target already has an authenticated GitLab.com identity; left it unchanged"
     return 0
@@ -271,7 +271,7 @@ ensure_agy_cli() {
   fi
   command -v curl >/dev/null 2>&1 || { record_error "curl is required to install the AGY CLI"; return; }
   say "Install the Google Antigravity CLI (agy)"
-  if ! curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --skip-path; then
+  if ! curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir "$(dirname "$binary")"; then
     record_error "Official AGY CLI installer failed"
     return
   fi
