@@ -367,7 +367,7 @@ local_deploy() {
   ensure_toolchain
   configure_manager
   install_services
-  sync_up_private_accounts
+  refresh_accounts
   "$LOCAL_BIN/agy-cli-manager" status --json || record_error "Could not read final manager status"
   if ((ERRORS)); then warn "Deployment finished with $ERRORS recoverable issue(s); see warnings above."; return 1; fi
   ok "Deployment complete. Quota rollover is active; restart a running agy process after a watcher-triggered account switch."
