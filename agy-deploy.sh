@@ -45,6 +45,46 @@ local_host() {
   return 1
 }
 
+bootstrap_remote_identity() {
+  local remote="$1" source_token=""
+  # Install gh before cloning the private repositories; never replace an
+  # authenticated target identity. The token travels only on SSH stdin.
+  if ! ssh -o ConnectTimeout=7 "$remote" 'command -v gh >/dev/null 2>&1 || { if command -v sudo >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y gh; else apt-get update -qq && apt-get install -y gh; fi; }' >/dev/null; then
+    warn "Could not install GitHub CLI on $remote"; return 1
+  fi
+  if ! ssh -o ConnectTimeout=7 "$remote" 'gh auth status --hostname github.com >/dev/null 2>&1'; then
+    if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
+      source_token="$(gh auth token --hostname github.com 2>/dev/null)" || source_token=""
+      if [[ -n "$source_token" ]]; then
+        printf '%s\n' "$source_token" | ssh -o ConnectTimeout=7 "$remote" \
+          'if gh auth status --hostname github.com >/dev/null 2>&1; then cat >/dev/null; else gh auth login --hostname github.com --with-token && gh auth setup-git --hostname github.com; fi' >/dev/null
+        unset source_token
+        ok "Transferred source GitHub CLI identity because target had no authenticated GitHub account"
+      else
+        warn "Source gh identity could not provide a token; private repo clone may prompt"
+      fi
+    else
+      warn "Source has no authenticated gh identity to transfer"
+    fi
+  else
+    ok "Target already has an authenticated GitHub identity; left it unchanged"
+  fi
+  if command -v glab >/dev/null 2>&1 && glab auth status --all >/dev/null 2>&1; then
+    if ! ssh -o ConnectTimeout=7 "$remote" 'glab auth status --all >/dev/null 2>&1'; then
+      local glab_config="$HOME/.config/glab-cli/config.yml"
+      if [[ -f "$glab_config" ]]; then
+        ssh -o ConnectTimeout=7 "$remote" 'mkdir -p ~/.config/glab-cli && chmod 700 ~/.config/glab-cli' &&
+          scp -q -o ConnectTimeout=7 "$glab_config" "$remote:~/.config/glab-cli/config.yml" &&
+          ssh -o ConnectTimeout=7 "$remote" 'chmod 600 ~/.config/glab-cli/config.yml'
+        ok "Copied source glab configuration because target had no GitLab identity"
+      else
+        warn "Source glab reports an identity but its config file is absent; keyring-only credentials cannot be copied"
+      fi
+    else
+      ok "Target already has an authenticated GitLab identity; left it unchanged"
+    fi
+  fi
+}
 remote_bootstrap() {
   local target="$1" user host base remote_tmp candidate
   user="${target%@*}"; host="${target#*@}"
@@ -69,9 +109,11 @@ remote_bootstrap() {
     seen+="$candidate "
     say "Trying SSH route ${user}@${candidate}"
     remote_tmp="/tmp/agy-command-${user}-$$.sh"
-    if scp -q -o ConnectTimeout=7 "$0" "${user}@${candidate}:${remote_tmp}" 2>/dev/null && \
-       ssh -t -o ConnectTimeout=7 "${user}@${candidate}" "chmod 700 '$remote_tmp' && bash '$remote_tmp' --local; rc=\$?; rm -f '$remote_tmp'; exit \$rc"; then
-      return 0
+    if scp -q -o ConnectTimeout=7 "$0" "${user}@${candidate}:${remote_tmp}" 2>/dev/null; then
+      bootstrap_remote_identity "${user}@${candidate}" || warn "Could not transfer source CLI identity over ${candidate}; continuing"
+      if ssh -t -o ConnectTimeout=7 "${user}@${candidate}" "chmod 700 '$remote_tmp' && bash '$remote_tmp' --local; rc=\$?; rm -f '$remote_tmp'; exit \$rc"; then
+        return 0
+      fi
     fi
     warn "SSH route ${candidate} failed; trying the next route"
   done
@@ -153,11 +195,12 @@ python = "latest"
 uv = "latest"
 ruby = "latest"
 bun = "latest"
+glab = "latest"
 EOF
   # Install user-local language runtimes/package managers only; no system
   # Python/Ruby/Bun installation is changed.
   local tool
-  for tool in python@latest uv@latest ruby@latest bun@latest; do
+  for tool in python@latest uv@latest ruby@latest bun@latest glab@latest; do
     step "Install/update mise tool $tool" "$mise_bin" install "$tool"
   done
   step "Upgrade Python package manager pip" "$mise_bin" exec python@latest -- python -m pip install --upgrade pip
