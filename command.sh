@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# Idempotent AGY account-manager bootstrap and maintenance.
+# Usage: ./command.sh user@targetHost
+# Modes used by installed services: --local, --maintain, --refresh, --watch
+set -uo pipefail
+
+MANAGER_URL="https://github.com/klepsydra/agy-cli-manager.git"
+MANAGER_UPSTREAM_URL="https://github.com/zcop/agy-cli-manager.git"
+TOKENS_URL="https://github.com/klepsydra/agy-tokens-and-settings.git"
+LIVE_DIR="${AGY_LIVE_DIR:-$HOME/.gemini}"
+MANAGER_ROOT="${AGY_MANAGER_ROOT:-$HOME/.agy-cli-manager}"
+MANAGER_REPO="$HOME/agy-cli-manager"
+TOKENS_REPO="$HOME/agy-tokens-and-settings"
+LOCAL_BIN="$HOME/.local/bin"
+DEPLOY_BIN="$LOCAL_BIN/agy-deploy"
+ERRORS=0
+
+say() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
+ok() { say "OK: $*"; }
+warn() { say "WARN: $*" >&2; }
+step() {
+  local label="$1"; shift
+  say "$label"
+  if "$@"; then ok "$label"; else warn "$label failed (continuing)"; ERRORS=$((ERRORS + 1)); return 0; fi
+}
+
+local_host() {
+  local user="$1" host="$2" short
+  [[ "$user" == "$(id -un)" ]] || return 1
+  case "$host" in localhost|127.0.0.1|::1|local|u) return 0 ;; esac
+  short="$(hostname -s 2>/dev/null || hostname)"
+  [[ "${host,,}" == "${short,,}" ]] && return 0
+  [[ "${host,,}" == "${short,,}.local" ]] && return 0
+  if command -v getent >/dev/null 2>&1 && command -v hostname >/dev/null 2>&1; then
+    local resolved local_ips ip
+    resolved="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+    local_ips="$(hostname -I 2>/dev/null | tr ' ' '\n' | sort -u || true)"
+    while IFS= read -r ip; do
+      [[ -n "$ip" ]] || continue
+      if grep -Fxq "$ip" <<<"$local_ips"; then return 0; fi
+    done <<<"$resolved"
+  fi
+  return 1
+}
+
+remote_bootstrap() {
+  local target="$1" user host base remote_tmp candidate
+  user="${target%@*}"; host="${target#*@}"
+  if [[ "$user" == "$target" || -z "$user" || -z "$host" ]]; then
+    warn "Target must be user@targetHost"; return 2
+  fi
+  if local_host "$user" "$host"; then
+    exec bash "$0" --local
+  fi
+
+  base="${host%.brill-bicolor.ts.net}"
+  local candidates=("$host")
+  [[ "$base" != "$host" ]] && candidates+=("$base" "${base}.local")
+  if [[ "$base" == "t14s" || "$host" == "t14s.local" ]]; then
+    candidates+=("t14s.local" "t14s.brill-bicolor.ts.net" "192.168.3.66")
+  fi
+  # Try each distinct route. The script is copied to /tmp so sudo can still
+  # prompt on the remote terminal; the supplied target's account owns the run.
+  local seen=' '
+  for candidate in "${candidates[@]}"; do
+    [[ "$seen" == *" $candidate "* ]] && continue
+    seen+="$candidate "
+    say "Trying SSH route ${user}@${candidate}"
+    remote_tmp="/tmp/agy-command-${user}-$$.sh"
+    if scp -q -o ConnectTimeout=7 "$0" "${user}@${candidate}:${remote_tmp}" 2>/dev/null && \
+       ssh -t -o ConnectTimeout=7 "${user}@${candidate}" "chmod 700 '$remote_tmp' && bash '$remote_tmp' --local; rc=\$?; rm -f '$remote_tmp'; exit \$rc"; then
+      return 0
+    fi
+    warn "SSH route ${candidate} failed; trying the next route"
+  done
+  warn "Could not reach $target using the supplied hostname, local hostname, or known t14s LAN address."
+  return 1
+}
+
+record_error() { warn "$*"; ERRORS=$((ERRORS + 1)); }
+
+install_system_dependencies() {
+  local packages=(ca-certificates curl git build-essential pkg-config libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev xz-utils cron gh)
+  command -v dpkg-query >/dev/null 2>&1 || { record_error "dpkg-query is unavailable; install Ubuntu/Debian prerequisites manually"; return; }
+  local missing=() package status
+  for package in "${packages[@]}"; do
+    status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+    [[ "$status" == "install ok installed" ]] || missing+=("$package")
+  done
+  ((${#missing[@]} == 0)) && { ok "Ubuntu system prerequisites already installed"; return; }
+  if ! command -v sudo >/dev/null 2>&1; then record_error "Missing packages (${missing[*]}) and sudo is unavailable"; return; fi
+  if ! sudo apt-get update || ! sudo apt-get install -y "${missing[@]}"; then
+    record_error "Could not install missing Ubuntu prerequisites: ${missing[*]}"
+  fi
+}
+
+ensure_repo() {
+  local path="$1" url="$2" upstream_url="${3:-}" actual
+  if [[ ! -e "$path" ]]; then
+    step "Clone $(basename "$path")" git clone "$url" "$path"
+  elif [[ ! -d "$path/.git" ]]; then
+    record_error "$path exists but is not a Git checkout; leaving it untouched"; return
+  fi
+  [[ -d "$path/.git" ]] || return
+  actual="$(git -C "$path" remote get-url origin 2>/dev/null || true)"
+  if [[ "$actual" != "$url" ]]; then record_error "$path origin is '$actual', expected '$url'; refusing to retarget it"; return; fi
+  if [[ -n "$upstream_url" ]]; then
+    actual="$(git -C "$path" remote get-url upstream 2>/dev/null || true)"
+    if [[ -z "$actual" ]]; then git -C "$path" remote add upstream "$upstream_url" || record_error "Could not add upstream remote in $path"
+    elif [[ "$actual" != "$upstream_url" ]]; then record_error "$path upstream is '$actual', expected '$upstream_url'"; return; fi
+  fi
+}
+
+update_repo() {
+  local path="$1" is_manager="$2"
+  [[ -d "$path/.git" ]] || { record_error "Cannot update absent checkout $path"; return; }
+  if [[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]]; then
+    record_error "$path has local changes; left it untouched instead of pulling over them"; return
+  fi
+  if ! git -C "$path" checkout main || ! git -C "$path" fetch origin main; then record_error "Could not fetch origin/main in $path"; return; fi
+  if ! git -C "$path" merge --ff-only origin/main; then record_error "Could not fast-forward $path from origin/main"; return; fi
+  if [[ "$is_manager" == yes ]]; then
+    if git -C "$path" fetch upstream main; then
+      if ! git -C "$path" merge --no-edit upstream/main; then
+        git -C "$path" merge --abort >/dev/null 2>&1 || true
+        record_error "Upstream zcop changes conflict with the Klepsydra fork in $path; review manually"
+        return
+      fi
+    else
+      record_error "Could not fetch zcop upstream for $path"; return
+    fi
+  fi
+  if ! git -C "$path" push origin main; then record_error "Could not push updated main for $path"; fi
+}
+
+ensure_toolchain() {
+  mkdir -p "$LOCAL_BIN" "$HOME/.venvs"
+  export PATH="$LOCAL_BIN:$HOME/.local/share/mise/shims:$PATH"
+  if ! command -v mise >/dev/null 2>&1; then
+    command -v curl >/dev/null 2>&1 || { record_error "curl is required to bootstrap mise"; return; }
+    if ! curl -fsSL https://mise.run | sh; then record_error "mise installation failed"; return; fi
+    export PATH="$LOCAL_BIN:$HOME/.local/share/mise/shims:$PATH"
+  fi
+  local mise_bin="$LOCAL_BIN/mise"
+  [[ -x "$mise_bin" ]] || mise_bin="$(command -v mise)"
+  step "Update mise" "$mise_bin" self-update -y
+  # Install user-local language runtimes/package managers only; no system
+  # Python/Ruby/Bun installation is changed.
+  local tool
+  for tool in python@latest uv@latest ruby@latest bun@latest; do
+    step "Install/update mise tool $tool" "$mise_bin" install "$tool"
+  done
+  step "Upgrade Python package manager pip" "$mise_bin" exec python@latest -- python -m pip install --upgrade pip
+  step "Upgrade RubyGems" "$mise_bin" exec ruby@latest -- gem update --system
+
+  local pyver venv
+  pyver="$("$mise_bin" latest python@latest 2>/dev/null || true)"
+  [[ -n "$pyver" ]] || { record_error "mise could not resolve Python latest"; return; }
+  venv="$HOME/.venvs/agy-cli-manager-$pyver"
+  if [[ ! -x "$venv/bin/python" ]]; then
+    if ! "$mise_bin" exec "python@$pyver" -- python -m venv "$venv"; then record_error "Could not create $venv"; return; fi
+  fi
+  if [[ -d "$MANAGER_REPO/.git" ]]; then
+    step "Upgrade manager package from the local checkout" "$venv/bin/python" -m pip install --upgrade --editable "$MANAGER_REPO"
+  fi
+  cat > "$LOCAL_BIN/agy-cli-manager" <<EOF
+#!/usr/bin/env bash
+exec "$venv/bin/agy-cli-manager" "\$@"
+EOF
+  chmod 755 "$LOCAL_BIN/agy-cli-manager"
+  cat > "$DEPLOY_BIN" <<'EOF'
+#!/usr/bin/env bash
+exec bash "$HOME/agy-tokens-and-settings/command.sh" "$@"
+EOF
+  chmod 755 "$DEPLOY_BIN"
+}
+
+private_tokens_repo() {
+  command -v gh >/dev/null 2>&1 || return 1
+  gh auth status >/dev/null 2>&1 || return 1
+  [[ "$(gh repo view klepsydra/agy-tokens-and-settings --json visibility --jq .visibility 2>/dev/null || true)" == PRIVATE ]]
+}
+
+sync_up_private_accounts() {
+  if ! private_tokens_repo; then
+    record_error "Skipped token/settings push: gh must be authenticated and klepsydra/agy-tokens-and-settings must report PRIVATE"
+    return
+  fi
+  if [[ -x "$TOKENS_REPO/sync-up.sh" ]]; then
+    step "Merge refreshed and unique local accounts into the private settings repo" bash "$TOKENS_REPO/sync-up.sh" "Automated account and settings sync"
+  else
+    record_error "sync-up.sh is missing from $TOKENS_REPO"
+  fi
+}
+
+configure_manager() {
+  local manager_bin="$LOCAL_BIN/agy-cli-manager"
+  [[ -x "$manager_bin" ]] || { record_error "agy-cli-manager is not installed"; return; }
+  step "Initialize manager state" "$manager_bin" init
+  if [[ -x "$TOKENS_REPO/sync-down.sh" ]]; then
+    step "Merge repository accounts/settings into this host" bash "$TOKENS_REPO/sync-down.sh" --non-interactive
+  else
+    record_error "sync-down.sh is missing from $TOKENS_REPO"
+  fi
+  step "Set the live Antigravity home" "$manager_bin" set-live-dir "$LIVE_DIR"
+  step "Enable automatic account switching" "$manager_bin" switch-mode auto
+  step "Set balanced proactive quota thresholds" "$manager_bin" switch-policy --gemini-threshold 10 --other-threshold 10 --refresh-failure-threshold 2 --candidate-strategy balanced
+  step "Select automatic credential backend" "$manager_bin" credential-backend auto
+  step "Ensure a usable account is active" "$manager_bin" ensure-active --json
+}
+
+install_services() {
+  local service_dir="$HOME/.config/systemd/user" cron_file tmp profile
+  mkdir -p "$service_dir" "$LOCAL_BIN"
+  cat > "$service_dir/agy-cli-manager-watch.service" <<EOF
+[Unit]
+Description=AGY account quota log watcher
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=$LOCAL_BIN/agy-deploy --watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  cat > "$service_dir/agy-account-refresh.service" <<EOF
+[Unit]
+Description=Refresh AGY account quotas and proactively select a usable account
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n $MANAGER_ROOT/refresh.lock $LOCAL_BIN/agy-deploy --refresh
+EOF
+  cat > "$service_dir/agy-account-refresh.timer" <<'EOF'
+[Unit]
+Description=Refresh AGY account quotas every ten minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+Unit=agy-account-refresh.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  cat > "$service_dir/agy-maintain.service" <<EOF
+[Unit]
+Description=Update AGY manager, tools, accounts, and settings
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n $MANAGER_ROOT/maintenance.lock $LOCAL_BIN/agy-deploy --maintain
+EOF
+  cat > "$service_dir/agy-maintain.timer" <<'EOF'
+[Unit]
+Description=Weekly AGY deployment and toolchain maintenance
+
+[Timer]
+OnCalendar=Sun *-*-* 04:15:00
+Persistent=true
+Unit=agy-maintain.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # Cron duplicates the refresh/maintenance timers and can start a watcher
+  # after WSL/Linux boot. flock prevents duplicate maintenance runs.
+  if command -v crontab >/dev/null 2>&1; then
+    tmp="$(mktemp)"
+    (crontab -l 2>/dev/null | sed '/# BEGIN AGY-DEPLOY/,/# END AGY-DEPLOY/d' || true) > "$tmp"
+    cat >> "$tmp" <<EOF
+# BEGIN AGY-DEPLOY
+*/10 * * * * /usr/bin/flock -n $MANAGER_ROOT/refresh.lock $LOCAL_BIN/agy-deploy --refresh >> $HOME/.agy-cli-manager/cron-refresh.log 2>&1
+15 4 * * 0 /usr/bin/flock -n $MANAGER_ROOT/maintenance.lock $LOCAL_BIN/agy-deploy --maintain >> $HOME/.agy-cli-manager/cron-maintain.log 2>&1
+@reboot $LOCAL_BIN/agy-deploy --start-watch >> $HOME/.agy-cli-manager/cron-watch.log 2>&1
+# END AGY-DEPLOY
+EOF
+    if crontab "$tmp"; then ok "Installed idempotent refresh/maintenance/watchdog cron jobs"; else record_error "Could not install crontab"; fi
+    rm -f "$tmp"
+  else
+    record_error "crontab is unavailable; refresh timer and watcher service still configured where systemd is available"
+  fi
+
+  if systemctl --user daemon-reload >/dev/null 2>&1; then
+    step "Enable manager log watcher service" systemctl --user enable --now agy-cli-manager-watch.service
+    step "Enable periodic quota refresh timer" systemctl --user enable --now agy-account-refresh.timer
+    step "Enable weekly maintenance timer" systemctl --user enable --now agy-maintain.timer
+    # Allow services to survive logout when the host supports user lingering.
+    if command -v loginctl >/dev/null 2>&1; then loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || warn "Could not enable user lingering; cron/login fallback remains installed"; fi
+  else
+    warn "systemd user manager unavailable; cron and login watcher fallbacks remain installed"
+  fi
+
+  cat > "$LOCAL_BIN/agy-watch-start" <<EOF
+#!/usr/bin/env bash
+mkdir -p "$MANAGER_ROOT"
+exec 9>"$MANAGER_ROOT/watch.lock"
+/usr/bin/flock -n 9 || exit 0
+exec "$LOCAL_BIN/agy-cli-manager" watch
+EOF
+  chmod 755 "$LOCAL_BIN/agy-watch-start"
+  profile="$HOME/.profile"
+  if ! grep -q 'AGY-DEPLOY-WATCH' "$profile" 2>/dev/null; then
+    cat >> "$profile" <<EOF
+
+# BEGIN AGY-DEPLOY-WATCH
+if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user is-system-running >/dev/null 2>&1; then
+  "$LOCAL_BIN/agy-deploy" --start-watch >/dev/null 2>&1 &
+fi
+# END AGY-DEPLOY-WATCH
+EOF
+  fi
+}
+
+refresh_accounts() {
+  local manager_bin="$LOCAL_BIN/agy-cli-manager"
+  [[ -x "$manager_bin" ]] || { record_error "agy-cli-manager is unavailable for refresh"; return; }
+  step "Poll new quota log lines and rotate on a quota error" "$manager_bin" watch --once --json
+  step "Refresh the next due account quota" "$manager_bin" refresh-due --json
+  step "Proactively ensure usable Gemini quota" "$manager_bin" ensure-active --family gemini --json
+  step "Proactively ensure usable other-family quota" "$manager_bin" ensure-active --family other --json
+  sync_up_private_accounts
+}
+
+local_deploy() {
+  say "Deploying AGY manager for $(id -un) on $(hostname -s)"
+  install_system_dependencies
+  ensure_toolchain
+  ensure_repo "$MANAGER_REPO" "$MANAGER_URL" "$MANAGER_UPSTREAM_URL"
+  ensure_repo "$TOKENS_REPO" "$TOKENS_URL"
+  update_repo "$MANAGER_REPO" yes
+  update_repo "$TOKENS_REPO" no
+  ensure_toolchain
+  configure_manager
+  install_services
+  sync_up_private_accounts
+  "$LOCAL_BIN/agy-cli-manager" status --json || record_error "Could not read final manager status"
+  if ((ERRORS)); then warn "Deployment finished with $ERRORS recoverable issue(s); see warnings above."; return 1; fi
+  ok "Deployment complete. Quota rollover is active; restart a running agy process after a watcher-triggered account switch."
+}
+
+maintain() {
+  install_system_dependencies
+  ensure_repo "$MANAGER_REPO" "$MANAGER_URL" "$MANAGER_UPSTREAM_URL"
+  ensure_repo "$TOKENS_REPO" "$TOKENS_URL"
+  update_repo "$MANAGER_REPO" yes
+  update_repo "$TOKENS_REPO" no
+  ensure_toolchain
+  configure_manager
+  refresh_accounts
+  if ((ERRORS)); then warn "Maintenance completed with $ERRORS recoverable issue(s)."; return 1; fi
+}
+
+case "${1:-}" in
+  --local) local_deploy ;;
+  --maintain) maintain ;;
+  --refresh) refresh_accounts ;;
+  --watch) exec "$LOCAL_BIN/agy-cli-manager" watch ;;
+  --start-watch) exec "$LOCAL_BIN/agy-watch-start" ;;
+  user@*) remote_bootstrap "$1" ;;
+  *)
+    cat >&2 <<'USAGE'
+Usage:
+  ./command.sh user@targetHost   Bootstrap/update a local or SSH target
+  ./command.sh --local           Deploy on the current Linux user
+
+Service modes are installed automatically: --watch, --refresh, --maintain.
+USAGE
+    exit 2
+    ;;
+esac
