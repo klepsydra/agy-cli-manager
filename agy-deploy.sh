@@ -56,10 +56,14 @@ bootstrap_remote_identity() {
     if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
       source_token="$(gh auth token --hostname github.com 2>/dev/null)" || source_token=""
       if [[ -n "$source_token" ]]; then
-        printf '%s\n' "$source_token" | ssh -o ConnectTimeout=7 "$remote" \
-          'if gh auth status --hostname github.com >/dev/null 2>&1; then cat >/dev/null; else gh auth login --hostname github.com --with-token && gh auth setup-git --hostname github.com; fi' >/dev/null
+        if printf '%s\n' "$source_token" | ssh -o ConnectTimeout=7 "$remote" \
+          'if gh auth status --hostname github.com >/dev/null 2>&1; then cat >/dev/null; else gh auth login --hostname github.com --with-token && gh auth setup-git --hostname github.com; fi' >/dev/null && \
+          ssh -o ConnectTimeout=7 "$remote" 'gh auth status --hostname github.com >/dev/null 2>&1'; then
+          ok "Transferred source GitHub CLI identity because target had no authenticated GitHub account"
+        else
+          warn "Could not import source GitHub identity on $remote"
+        fi
         unset source_token
-        ok "Transferred source GitHub CLI identity because target had no authenticated GitHub account"
       else
         warn "Source gh identity could not provide a token; private repo clone may prompt"
       fi
@@ -69,22 +73,32 @@ bootstrap_remote_identity() {
   else
     ok "Target already has an authenticated GitHub identity; left it unchanged"
   fi
-  if command -v glab >/dev/null 2>&1 && glab auth status --all >/dev/null 2>&1; then
-    if ! ssh -o ConnectTimeout=7 "$remote" 'glab auth status --all >/dev/null 2>&1'; then
-      local glab_config="$HOME/.config/glab-cli/config.yml"
-      if [[ -f "$glab_config" ]]; then
-        ssh -o ConnectTimeout=7 "$remote" 'mkdir -p ~/.config/glab-cli && chmod 700 ~/.config/glab-cli' &&
-          scp -q -o ConnectTimeout=7 "$glab_config" "$remote:~/.config/glab-cli/config.yml" &&
-          ssh -o ConnectTimeout=7 "$remote" 'chmod 600 ~/.config/glab-cli/config.yml'
-        ok "Copied source glab configuration because target had no GitLab identity"
-      else
-        warn "Source glab reports an identity but its config file is absent; keyring-only credentials cannot be copied"
-      fi
-    else
-      ok "Target already has an authenticated GitLab identity; left it unchanged"
-    fi
-  fi
+
 }
+transfer_remote_glab_identity() {
+  local remote="$1" status source_token
+  command -v glab >/dev/null 2>&1 || return 0
+  status="$(NO_COLOR=1 TERM=dumb glab auth status --hostname gitlab.com --show-token 2>&1)" || {
+    warn "Source has no exportable GitLab.com identity"; return 0;
+  }
+  source_token="$(awk -F": " 'tolower($1) ~ /token/ {print $2; exit}' <<<"$status")"
+  unset status
+  [[ -n "$source_token" ]] || { warn "Source glab did not expose a GitLab.com token"; return 0; }
+  if ssh -o ConnectTimeout=7 "$remote" 'glab auth status --hostname gitlab.com >/dev/null 2>&1'; then
+    unset source_token
+    ok "Target already has an authenticated GitLab.com identity; left it unchanged"
+    return 0
+  fi
+  if printf '%s\n' "$source_token" | ssh -o ConnectTimeout=7 "$remote" \
+      'export PATH=$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin; if glab auth status --hostname gitlab.com >/dev/null 2>&1; then cat >/dev/null; else glab auth login --hostname gitlab.com --stdin --setup-git-credential-helper; fi' >/dev/null && \
+      ssh -o ConnectTimeout=7 "$remote" 'export PATH=$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin; glab auth status --hostname gitlab.com >/dev/null 2>&1'; then
+    ok "Transferred source GitLab.com CLI identity because target had no authenticated GitLab.com account"
+  else
+    warn "Could not import the source GitLab.com identity; target glab may need a device login"
+  fi
+  unset source_token
+}
+
 remote_bootstrap() {
   local target="$1" user host base remote_tmp candidate
   user="${target%@*}"; host="${target#*@}"
@@ -111,8 +125,11 @@ remote_bootstrap() {
     remote_tmp="/tmp/agy-command-${user}-$$.sh"
     if scp -q -o ConnectTimeout=7 "$0" "${user}@${candidate}:${remote_tmp}" 2>/dev/null; then
       bootstrap_remote_identity "${user}@${candidate}" || warn "Could not transfer source CLI identity over ${candidate}; continuing"
-      if ssh -t -o ConnectTimeout=7 "${user}@${candidate}" "chmod 700 '$remote_tmp' && bash '$remote_tmp' --local; rc=\$?; rm -f '$remote_tmp'; exit \$rc"; then
-        return 0
+      local remote_rc=0
+      ssh -t -o ConnectTimeout=7 "${user}@${candidate}" "chmod 700 '$remote_tmp' && bash '$remote_tmp' --local; rc=\$?; rm -f '$remote_tmp'; exit \$rc" || remote_rc=$?
+      if ((remote_rc != 255)); then
+        transfer_remote_glab_identity "${user}@${candidate}"
+        return "$remote_rc"
       fi
     fi
     warn "SSH route ${candidate} failed; trying the next route"
