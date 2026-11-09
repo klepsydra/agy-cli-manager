@@ -1,0 +1,23 @@
+[Unit]
+Description=Antigravity CLI Account Manager – log watcher for %i
+Documentation=https://github.com/klepsydra/agy-cli-manager
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=~
+# Systemd automatically sets HOME to the user's home directory.
+Environment=AGY_CLI_MANAGER_BIN=
+
+ExecStart=/usr/local/bin/agy-cli-manager-for-user watch
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agy-cli-manager-watch-%i
+
+[Install]
+WantedBy=multi-user.target

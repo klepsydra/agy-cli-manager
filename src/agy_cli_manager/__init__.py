@@ -38,6 +38,15 @@ from agy_cli_manager.watch import (
     poll_quota_logs,
     watch_quota_logs,
 )
+from agy_cli_manager.daemon import (
+    daemon_disable,
+    daemon_enable,
+    daemon_install,
+    daemon_scan,
+    daemon_status,
+    daemon_uninstall,
+    discover_users,
+)
 
 __all__ = [
     "ManagerPaths",
@@ -74,4 +83,11 @@ __all__ = [
     "parse_quota_log_line",
     "poll_quota_logs",
     "watch_quota_logs",
+    "discover_users",
+    "daemon_status",
+    "daemon_install",
+    "daemon_uninstall",
+    "daemon_enable",
+    "daemon_disable",
+    "daemon_scan",
 ]

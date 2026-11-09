@@ -57,6 +57,15 @@ from agy_cli_manager.watch import (
     poll_quota_logs,
     watch_quota_logs,
 )
+from agy_cli_manager.daemon import (
+    daemon_disable,
+    daemon_enable,
+    daemon_install,
+    daemon_scan,
+    daemon_status,
+    daemon_uninstall,
+    discover_users,
+)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agy-cli-manager")
@@ -226,7 +235,43 @@ def build_parser() -> argparse.ArgumentParser:
     update_meta.add_argument("--next-live-check-at")
     update_meta.add_argument("--refresh-policy-seconds", type=int)
     update_meta.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    _add_daemon_subparser(sub, "daemon")
+    _add_daemon_subparser(sub, "service")
     return parser
+
+
+def _add_daemon_subparser(sub, name: str) -> None:
+    p = sub.add_parser(name, help="Manage systemd watch daemon service for users")
+    d_sub = p.add_subparsers(dest=f"{name}_action")
+
+    d_inst = d_sub.add_parser("install", help="Install systemd watch service and helper scripts")
+    d_inst.add_argument("--systemd", action="store_true", default=True, help="Install as systemd service")
+    d_inst.add_argument("--no-timer", action="store_true", help="Do not install periodic user discovery timer")
+    d_inst.add_argument("--marker-dir", default=".agy-tokens-and-settings", help="Marker directory to detect users")
+    d_inst.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    d_stat = d_sub.add_parser("status", help="Show daemon status for discovered users")
+    d_stat.add_argument("users", nargs="*", help="Specific users to check")
+    d_stat.add_argument("--marker-dir", default=".agy-tokens-and-settings", help="Marker directory to detect users")
+    d_stat.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    d_en = d_sub.add_parser("enable", help="Enable and start watch daemon for user(s)")
+    d_en.add_argument("users", nargs="*", help="Users to enable (default: all discovered)")
+    d_en.add_argument("--marker-dir", default=".agy-tokens-and-settings", help="Marker directory to detect users")
+    d_en.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    d_dis = d_sub.add_parser("disable", help="Stop and disable watch daemon for user(s)")
+    d_dis.add_argument("users", nargs="*", help="Users to disable (default: all discovered)")
+    d_dis.add_argument("--marker-dir", default=".agy-tokens-and-settings", help="Marker directory to detect users")
+    d_dis.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    d_scan = d_sub.add_parser("scan", help="Sync active services with users having ~/.agy-tokens-and-settings/")
+    d_scan.add_argument("--marker-dir", default=".agy-tokens-and-settings", help="Marker directory to detect users")
+    d_scan.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    d_un = d_sub.add_parser("uninstall", help="Stop and remove systemd service and helper scripts")
+    d_un.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
 
 def prompt_nonempty(label: str) -> str:
@@ -1888,12 +1933,97 @@ def print_proxy_show(paths, name: str | None, as_json: bool) -> None:
     print(f"proxy_url: {proxy.get('url') or '-'}")
 
 
+def _handle_daemon_command(action: str | None, args: argparse.Namespace) -> int:
+    if action is None or action == "status":
+        users = getattr(args, "users", None) or None
+        marker_dir = getattr(args, "marker_dir", ".agy-tokens-and-settings")
+        results = daemon_status(marker_dir=marker_dir, users=users)
+        if getattr(args, "json", False):
+            print(json.dumps(results, indent=2, sort_keys=True))
+        else:
+            if not results:
+                print("No users found with marker directory or requested.")
+            for r in results:
+                act = "active (running)" if r["active"] else "inactive"
+                enb = "enabled" if r["enabled"] else "disabled"
+                print(f"User: {r['user']:12s} | Status: {act:18s} | Unit: {enb:8s} | Home: {r.get('home') or '-'}")
+        return 0
+
+    if action == "install":
+        marker_dir = getattr(args, "marker_dir", ".agy-tokens-and-settings")
+        no_timer = getattr(args, "no_timer", False)
+        result = daemon_install(
+            marker_dir=marker_dir,
+            enable_all=True,
+            install_scan_timer=not no_timer,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("agy-cli-manager systemd watch daemon installed successfully.")
+            print(f"  Unit:        {result['systemd_unit']}")
+            print(f"  Scan Timer:  {result['scan_timer']}")
+            print(f"  Wrapper:     {result['wrapper_bin']}")
+            print(f"  Enabler:     {result['enable_bin']}")
+            if result.get("enabled_users"):
+                print(f"  Enabled for: {', '.join(result['enabled_users'])}")
+            else:
+                print("  Enabled for: (none currently discovered; scan timer will start when created)")
+        return 0
+
+    if action == "enable":
+        users = getattr(args, "users", None) or None
+        marker_dir = getattr(args, "marker_dir", ".agy-tokens-and-settings")
+        result = daemon_enable(users=users, marker_dir=marker_dir)
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"Enabled and started watch daemon for: {', '.join(result['users']) if result['users'] else '(none)'}")
+        return 0
+
+    if action == "disable":
+        users = getattr(args, "users", None) or None
+        marker_dir = getattr(args, "marker_dir", ".agy-tokens-and-settings")
+        result = daemon_disable(users=users, marker_dir=marker_dir)
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"Disabled and stopped watch daemon for: {', '.join(result['users']) if result['users'] else '(none)'}")
+        return 0
+
+    if action == "scan":
+        marker_dir = getattr(args, "marker_dir", ".agy-tokens-and-settings")
+        result = daemon_scan(marker_dir=marker_dir)
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"Discovered users with ~/{marker_dir}: {', '.join(result['discovered_users']) if result['discovered_users'] else '(none)'}")
+            if result["newly_started"]:
+                print(f"Started newly discovered: {', '.join(result['newly_started'])}")
+            else:
+                print("All discovered users already have watch services active.")
+        return 0
+
+    if action == "uninstall":
+        result = daemon_uninstall()
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("agy-cli-manager systemd watch daemon uninstalled.")
+        return 0
+
+    return 2
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     paths = build_paths(args.root)
 
     try:
+        if args.command in ("daemon", "service"):
+            action = getattr(args, f"{args.command}_action", None)
+            return _handle_daemon_command(action, args)
         if args.command is None:
             return run_dashboard(paths)
         if args.command == "dashboard":

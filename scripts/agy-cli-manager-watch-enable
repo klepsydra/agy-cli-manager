@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# agy-cli-manager-watch-enable
+#
+# Discovers users who have ~/.agy-tokens-and-settings/ and manages the
+# agy-cli-manager-watch@<user>.service systemd instance for each.
+#
+# Usage:
+#   agy-cli-manager-watch-enable [--dry-run] [--disable] [--status] [--scan] [USER...]
+#
+# With no USER arguments, scans all home directories under /home/ and /root.
+# Requires root (sudo).
+
+set -euo pipefail
+
+UNIT_TEMPLATE="agy-cli-manager-watch@"
+MARKER_DIR="${AGY_MARKER_DIR:-.agy-tokens-and-settings}"
+DRY_RUN=false
+ACTION="enable"   # enable | disable | status | scan
+EXPLICIT_USERS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)   DRY_RUN=true ;;
+        --disable)   ACTION="disable" ;;
+        --status)    ACTION="status" ;;
+        --scan)      ACTION="scan" ;;
+        --marker)    shift; MARKER_DIR="$1" ;;
+        --help|-h)
+            cat <<'EOF'
+Usage: agy-cli-manager-watch-enable [OPTIONS] [USER...]
+
+Discovers users with ~/.agy-tokens-and-settings/ and manages the
+agy-cli-manager-watch@<user>.service systemd unit for each.
+
+Options:
+  --dry-run      Show what would be done without making changes
+  --disable      Disable and stop the service instead of enabling it
+  --status       Show current status for all discovered users
+  --scan         Sync running units with discovered users (enable new, stop removed)
+  --marker DIR   Marker directory name (default: .agy-tokens-and-settings)
+  -h, --help     Show this help
+EOF
+            exit 0
+            ;;
+        -*) echo "Unknown option: $1" >&2; exit 1 ;;
+        *)  EXPLICIT_USERS+=("$1") ;;
+    esac
+    shift
+done
+
+if [[ $EUID -ne 0 ]] && [[ "$DRY_RUN" == false ]] && [[ "$ACTION" != "status" ]]; then
+    echo "error: must be run as root (use sudo)" >&2
+    exit 1
+fi
+
+discover_users() {
+    while IFS=: read -r username _ uid _ _ homedir _; do
+        [[ -z "$username" || -z "$homedir" ]] && continue
+        if [[ -d "${homedir}/${MARKER_DIR}" ]]; then
+            echo "$username"
+        fi
+    done < /etc/passwd
+}
+
+if [[ ${#EXPLICIT_USERS[@]} -gt 0 ]]; then
+    USERS=("${EXPLICIT_USERS[@]}")
+else
+    mapfile -t USERS < <(discover_users | sort -u)
+fi
+
+user_home() {
+    local user="$1"
+    if [[ "$user" == "root" ]]; then echo "/root"; return; fi
+    getent passwd "$user" | cut -d: -f6
+}
+
+runcmd() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [dry-run] $*"
+    else
+        "$@"
+    fi
+}
+
+echo "agy-cli-manager-watch-enable: action=${ACTION} users=${USERS[*]:-(none)}"
+echo ""
+
+case "$ACTION" in
+    status)
+        for user in "${USERS[@]}"; do
+            unit="${UNIT_TEMPLATE}${user}.service"
+            echo "── $user ────────────────────────────────"
+            systemctl status "$unit" --no-pager -l 2>&1 | head -15 || true
+            echo ""
+        done
+        ;;
+    enable)
+        for user in "${USERS[@]}"; do
+            unit="${UNIT_TEMPLATE}${user}.service"
+            home=$(user_home "$user" 2>/dev/null || true)
+            echo "── $user (home: ${home:-unknown}) ──────────────────"
+            if ! id "$user" &>/dev/null; then
+                echo "  SKIP: user '$user' does not exist"
+                continue
+            fi
+            if [[ -n "$home" && ! -d "${home}/${MARKER_DIR}" ]]; then
+                echo "  SKIP: ${home}/${MARKER_DIR} does not exist"
+                continue
+            fi
+            echo "  Enabling and starting ${unit}..."
+            runcmd systemctl daemon-reload
+            runcmd systemctl enable "$unit"
+            runcmd systemctl restart "$unit"
+            if [[ "$DRY_RUN" == false ]]; then
+                sleep 0.5
+                systemctl is-active "$unit" >/dev/null && echo "  ✓ running" || echo "  ✗ failed to start"
+            fi
+            echo ""
+        done
+        ;;
+    disable)
+        for user in "${USERS[@]}"; do
+            unit="${UNIT_TEMPLATE}${user}.service"
+            echo "── Stopping and disabling ${unit} ──────────────────"
+            runcmd systemctl stop "$unit" || true
+            runcmd systemctl disable "$unit" || true
+            echo ""
+        done
+        ;;
+    scan)
+        runcmd systemctl daemon-reload
+        # Enable all discovered users with marker directory
+        for user in "${USERS[@]}"; do
+            unit="${UNIT_TEMPLATE}${user}.service"
+            if ! systemctl is-active "$unit" &>/dev/null; then
+                echo "Discovered new user with ~/${MARKER_DIR}: $user. Starting ${unit}..."
+                runcmd systemctl enable "$unit"
+                runcmd systemctl restart "$unit"
+            fi
+        done
+        # Stop any active units whose user no longer has the marker directory
+        for active_unit in $(systemctl list-units --type=service --state=running "${UNIT_TEMPLATE}*.service" --no-legend 2>/dev/null | awk '{print $1}'); do
+            user="${active_unit#$UNIT_TEMPLATE}"
+            user="${user%.service}"
+            home=$(user_home "$user" 2>/dev/null || true)
+            if [[ -n "$home" && ! -d "${home}/${MARKER_DIR}" ]]; then
+                echo "User '$user' no longer has ~/${MARKER_DIR}. Stopping ${active_unit}..."
+                runcmd systemctl stop "$active_unit" || true
+                runcmd systemctl disable "$active_unit" || true
+            fi
+        done
+        ;;
+esac
+
+echo "Done."

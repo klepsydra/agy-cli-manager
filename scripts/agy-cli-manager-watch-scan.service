@@ -1,0 +1,11 @@
+[Unit]
+Description=Scan for users with ~/.agy-tokens-and-settings/ and update agy watch daemons
+Documentation=https://github.com/klepsydra/agy-cli-manager
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agy-cli-manager-watch-enable --scan
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agy-cli-manager-watch-scan

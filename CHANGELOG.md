@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- add `agy-cli-manager daemon` / `service` CLI for systemd multi-user watch daemon management
+- add `daemon install --systemd` to install templated service, discovery timer, and helper scripts
+- support automatic discovery and activation for all users with `~/.agy-tokens-and-settings/`
+- add `agy-cli-manager-watch-scan.timer` to periodically detect newly added users and manage active instances
+- integrate system service installer into `agy-deploy.sh` and provide standalone installation scripts in `scripts/`
+- handle permissions safely when scanning user directories across system accounts
+
 ## v0.2.3 - 2026-10-03
 
 - parse and persist separate Gemini and Claude/GPT-OSS quota families

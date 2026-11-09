@@ -155,6 +155,33 @@ agy-cli-manager ack-restart
 
 Leave the dashboard open instead of `watch` if you prefer (`Y` acknowledges the restart). Do not pass `--from-start` unless you intend to replay old quota errors.
 
+### Running as a Multi-User Systemd Service
+
+To run the log watcher continuously in the background for all users who have `~/.agy-tokens-and-settings/`:
+
+```bash
+# Install the systemd template unit, discovery timer, and helper scripts:
+sudo agy-cli-manager daemon install --systemd
+
+# Check daemon status across all discovered users:
+agy-cli-manager daemon status
+
+# Manually trigger a user scan (detects new users with ~/.agy-tokens-and-settings/):
+sudo agy-cli-manager daemon scan
+
+# Enable or disable specific users:
+sudo agy-cli-manager daemon enable <user>
+sudo agy-cli-manager daemon disable <user>
+
+# Uninstall the service and discovery timer:
+sudo agy-cli-manager daemon uninstall
+```
+
+The systemd setup installs:
+- `agy-cli-manager-watch@<user>.service`: Runs `agy-cli-manager watch` isolated under the respective user account, using their own environment and venv.
+- `agy-cli-manager-watch-scan.timer`: Periodically scans for users with `~/.agy-tokens-and-settings/` and automatically starts their watch daemon without manual intervention.
+- `agy-cli-manager-for-user`: Per-user launcher resolving the user's specific `agy-cli-manager` binary across `~/.local/bin`, `~/.venv/bin`, mise `~/.venvs/`, or PATH.
+
 ## First Useful Commands
 
 ```bash

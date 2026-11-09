@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# agy-cli-manager-for-user
+#
+# Wrapper that locates the correct agy-cli-manager binary for the current user
+# and exec's it with all arguments passed through.
+#
+# Search order:
+#   1. $AGY_CLI_MANAGER_BIN (explicit override)
+#   2. ~/.local/bin/agy-cli-manager
+#   3. ~/.venv/bin/agy-cli-manager
+#   4. ~/.venvs/agy-cli-manager-*/bin/agy-cli-manager
+#   5. First hit on PATH
+
+set -euo pipefail
+
+USER_NAME="$(id -un)"
+USER_HOME="${HOME:-$(getent passwd "$USER_NAME" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-/home/$USER_NAME}"
+export HOME="$USER_HOME"
+
+find_binary() {
+    if [[ -n "${AGY_CLI_MANAGER_BIN:-}" && -x "$AGY_CLI_MANAGER_BIN" ]]; then
+        echo "$AGY_CLI_MANAGER_BIN"
+        return 0
+    fi
+
+    local candidates=(
+        "${USER_HOME}/.local/bin/agy-cli-manager"
+        "${USER_HOME}/.venv/bin/agy-cli-manager"
+    )
+    for bin in "${candidates[@]}"; do
+        if [[ -x "$bin" ]]; then
+            echo "$bin"
+            return 0
+        fi
+    done
+
+    # Check ~/.venvs/agy-cli-manager-*/bin/agy-cli-manager (created by agy-deploy.sh)
+    for bin in "${USER_HOME}"/.venvs/agy-cli-manager-*/bin/agy-cli-manager; do
+        if [[ -x "$bin" ]]; then
+            echo "$bin"
+            return 0
+        fi
+    done
+
+    # Fall back to PATH
+    if command -v agy-cli-manager &>/dev/null; then
+        command -v agy-cli-manager
+        return 0
+    fi
+
+    echo "agy-cli-manager-for-user: cannot find agy-cli-manager binary for user '${USER_NAME}'" >&2
+    echo "  Checked: ~/.local/bin, ~/.venv/bin, ~/.venvs/agy-cli-manager-*, and PATH" >&2
+    echo "  Set AGY_CLI_MANAGER_BIN to override." >&2
+    exit 1
+}
+
+bin=$(find_binary)
+exec "$bin" "$@"

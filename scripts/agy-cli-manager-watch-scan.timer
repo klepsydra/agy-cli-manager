@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically scan for users with ~/.agy-tokens-and-settings/
+Documentation=https://github.com/klepsydra/agy-cli-manager
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

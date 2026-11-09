@@ -479,6 +479,15 @@ fi
 # END AGY-DEPLOY-WATCH
 EOF
   fi
+
+  # Install multi-user systemd watch service for all users who have ~/.agy-tokens-and-settings/
+  if command -v systemctl >/dev/null 2>&1 && { [[ $EUID -eq 0 ]] || sudo -n true >/dev/null 2>&1; }; then
+    if [[ -x "$LOCAL_BIN/agy-cli-manager" ]]; then
+      step "Install multi-user systemd watch service" "$LOCAL_BIN/agy-cli-manager" daemon install --systemd
+    elif [[ -x "$MANAGER_REPO/scripts/install-system-service.sh" ]]; then
+      step "Install multi-user systemd watch service" sudo bash "$MANAGER_REPO/scripts/install-system-service.sh"
+    fi
+  fi
 }
 
 refresh_accounts() {
